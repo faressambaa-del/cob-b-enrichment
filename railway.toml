@@ -6,5 +6,6 @@ dockerfilePath = "Dockerfile"
 restartPolicyType = "on_failure"
 restartPolicyMaxRetries = 3
 
-[[services]]
-name = "cobb-scraper"
+[deploy.healthcheck]
+path = "/health"
+timeout = 30
