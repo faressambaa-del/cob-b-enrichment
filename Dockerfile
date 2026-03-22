@@ -1,14 +1,16 @@
-# Use Apify's official Playwright Docker image — this includes Playwright + browsers pre-installed
-FROM apify/actor-node-playwright-chrome:20
+FROM mcr.microsoft.com/playwright:v1.42.0-jammy
 
-# Copy package files first
+WORKDIR /app
+
 COPY package*.json ./
 
-# Install dependencies
-RUN npm install --omit=dev
+RUN npm ci --only=production
 
-# Copy the rest of the actor files
-COPY . ./
+RUN npx playwright install chromium
 
-# Run the actor
-CMD npm start
+COPY server.js ./
+
+ENV PORT=3000
+EXPOSE 3000
+
+CMD ["node", "server.js"]
