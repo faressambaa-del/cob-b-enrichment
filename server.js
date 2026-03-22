@@ -4,7 +4,7 @@ const { chromium } = require('playwright');
 const app = express();
 app.use(express.json());
 
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 8080;
 const BASE_URL = 'http://inmate-search.cobbsheriff.org';
 
 // ─────────────────────────────────────────────────────────────
@@ -20,8 +20,8 @@ app.get('/health', (req, res) => {
 
 // ─────────────────────────────────────────────────────────────
 // HELPER — FORMAT NAME
-// Gazette names: "Garcia, Elvia Yadira" or "RANKIN SHAWN MARCUS"
-// Cobb County needs: "LAST FIRST" (last name space first name)
+// Gazette: "Garcia, Elvia Yadira" → "GARCIA ELVIA"
+// Gazette: "RANKIN SHAWN MARCUS"  → "RANKIN SHAWN"
 // ─────────────────────────────────────────────────────────────
 function formatNameForSearch(raw) {
   if (!raw) return '';
@@ -58,16 +58,6 @@ async function launchBrowser() {
 // POST /scrape { name: "Garcia, Elvia Yadira" }
 //              { name: "RANKIN SHAWN" }
 //              { soid: "001115049" }
-//
-// Exact flow from Cobb County screenshots:
-//   1. Load inmate-search.cobbsheriff.org
-//   2. Fill NAME field (Last name space first name)
-//   3. Set dropdown to Inquiry
-//   4. Click Search
-//   5. Read results table row
-//   6. Click Last Known Booking button
-//   7. Scrape full detail page
-//   8. Return JSON ready for Supabase inmate_details table
 // ─────────────────────────────────────────────────────────────
 app.post('/scrape', async (req, res) => {
   const { name, soid } = req.body;
@@ -87,8 +77,8 @@ app.post('/scrape', async (req, res) => {
 
     // ── STEP 1: Load search page ──────────────────────────────
     console.log(`[scrape] Searching: ${name || soid}`);
-    await page.goto(BASE_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
-    await page.waitForSelector('input[name="name"], input[name="NAME"]', { timeout: 10000 });
+    await page.goto(BASE_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    await page.waitForSelector('input[name="name"], input[name="NAME"]', { timeout: 20000 });
 
     // ── STEP 2: Fill form ─────────────────────────────────────
     if (soid) {
@@ -97,7 +87,7 @@ app.post('/scrape', async (req, res) => {
     }
     if (name) {
       const formatted = formatNameForSearch(name);
-      console.log(`[scrape] Formatted name: "${formatted}"`);
+      console.log(`[scrape] Formatted: "${formatted}"`);
       const nameInput = await page.$('input[name="name"], input[name="NAME"]');
       if (nameInput) await nameInput.fill(formatted);
     }
@@ -108,10 +98,10 @@ app.post('/scrape', async (req, res) => {
 
     // ── STEP 4: Click Search ──────────────────────────────────
     const searchBtn = await page.$('input[value="Search"]');
-    if (!searchBtn) throw new Error('Search button not found on page');
+    if (!searchBtn) throw new Error('Search button not found');
 
     await Promise.all([
-      page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 30000 }),
+      page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 60000 }),
       searchBtn.click()
     ]);
 
@@ -128,7 +118,7 @@ app.post('/scrape', async (req, res) => {
       return res.json({ success: true, found: false, name: name || soid, data: null });
     }
 
-    // Read summary row: Image|Name|DOB|Race|Sex|Location|SOID|Days|Booking|Previous
+    // Read summary row
     const summaryRow = await page.evaluate(() => {
       const rows = Array.from(document.querySelectorAll('table tr'));
       for (const row of rows) {
@@ -170,7 +160,7 @@ app.post('/scrape', async (req, res) => {
     }
 
     await Promise.all([
-      page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 30000 }),
+      page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 60000 }),
       bookingBtn.click()
     ]);
 
@@ -191,14 +181,12 @@ app.post('/scrape', async (req, res) => {
         }
         return -1;
       }
-
       function findRowP(label) {
         for (let i = 0; i < allRows.length; i++) {
           if ((allRows[i][0] || '').toLowerCase().includes(label.toLowerCase())) return i;
         }
         return -1;
       }
-
       function findCell(label) {
         for (let i = 0; i < allRows.length; i++) {
           for (let j = 0; j < (allRows[i] || []).length; j++) {
@@ -207,7 +195,6 @@ app.post('/scrape', async (req, res) => {
         }
         return null;
       }
-
       function findCellP(label) {
         for (let i = 0; i < allRows.length; i++) {
           for (let j = 0; j < (allRows[i] || []).length; j++) {
@@ -217,7 +204,7 @@ app.post('/scrape', async (req, res) => {
         return null;
       }
 
-      // Booking Information section
+      // Booking Information
       const bHdr = findRow('Agency ID');
       const bDat = bHdr >= 0 ? bHdr + 1 : -1;
       const agencyId        = bDat >= 0 ? c(bDat, 0) : '';
@@ -225,7 +212,7 @@ app.post('/scrape', async (req, res) => {
       const bookingStarted  = bDat >= 0 ? c(bDat, 2) : '';
       const bookingComplete = bDat >= 0 ? c(bDat, 3) : '';
 
-      // Personal Information section
+      // Personal Information
       const pHdr = findRow('Name');
       const pDat = pHdr >= 0 ? pHdr + 1 : -1;
       const fullName      = pDat >= 0 ? c(pDat, 0) : '';
@@ -248,8 +235,8 @@ app.post('/scrape', async (req, res) => {
       }
 
       // Address
-      const aHdr      = findRow('Address');
-      const aDat      = aHdr >= 0 ? aHdr + 1 : -1;
+      const aHdr       = findRow('Address');
+      const aDat       = aHdr >= 0 ? aHdr + 1 : -1;
       const addrStreet = aDat >= 0 ? c(aDat, 0) : '';
       const addrCity   = aDat >= 0 ? c(aDat, 1) : '';
       const addrState  = aDat >= 0 ? c(aDat, 2) : '';
@@ -261,12 +248,12 @@ app.post('/scrape', async (req, res) => {
       const placeOfBirth = pobHdr >= 0 ? c(pobHdr, 1) : '';
 
       // Arrest Circumstances
-      const arHdr          = findRow('Arrest Agency');
-      const arDat          = arHdr >= 0 ? arHdr + 1 : -1;
-      const arrestAgency   = arDat >= 0 ? c(arDat, 0) : '';
-      const arrestOfficer  = arDat >= 0 ? c(arDat, 1) : '';
-      const locOfArrest    = arDat >= 0 ? c(arDat, 2) : '';
-      const serialNumber   = arDat >= 0 ? c(arDat, 3) : '';
+      const arHdr         = findRow('Arrest Agency');
+      const arDat         = arHdr >= 0 ? arHdr + 1 : -1;
+      const arrestAgency  = arDat >= 0 ? c(arDat, 0) : '';
+      const arrestOfficer = arDat >= 0 ? c(arDat, 1) : '';
+      const locOfArrest   = arDat >= 0 ? c(arDat, 2) : '';
+      const serialNumber  = arDat >= 0 ? c(arDat, 3) : '';
 
       // Warrant / Case
       const wCell   = findCell('Warrant');
@@ -277,8 +264,8 @@ app.post('/scrape', async (req, res) => {
       const otn     = oCell ? c(oCell.r, oCell.c + 1) : '';
 
       // Charges
-      const chHdr  = findRow('Offense Date');
-      const baHdr  = findRow('Bond Amount');
+      const chHdr   = findRow('Offense Date');
+      const baHdr   = findRow('Bond Amount');
       const charges = [];
       if (chHdr >= 0) {
         const end = baHdr >= 0 ? baHdr : chHdr + 25;
@@ -306,11 +293,11 @@ app.post('/scrape', async (req, res) => {
       }).filter(Boolean))].join('; ');
 
       // Bond
-      const baCell      = findCell('Bond Amount');
-      const totalBond   = baCell ? c(baCell.r, baCell.c + 1) : '';
-      const bsCell      = findCellP('Bond Status');
-      const bondStatus  = bsCell ? c(bsCell.r, bsCell.c + 1) : '';
-      const bondingCo   = bsCell ? c(bsCell.r, bsCell.c + 2) : '';
+      const baCell     = findCell('Bond Amount');
+      const totalBond  = baCell ? c(baCell.r, baCell.c + 1) : '';
+      const bsCell     = findCellP('Bond Status');
+      const bondStatus = bsCell ? c(bsCell.r, bsCell.c + 1) : '';
+      const bondingCo  = bsCell ? c(bsCell.r, bsCell.c + 2) : '';
 
       // Bondsman / Case-Warrant
       const cwCell     = findCellP('Case/Warrant');
@@ -322,7 +309,7 @@ app.post('/scrape', async (req, res) => {
       }
 
       // Disposition
-      const dispCell   = findCell('Disposition');
+      const dispCell    = findCell('Disposition');
       const disposition = dispCell ? c(dispCell.r, dispCell.c + 1) : '';
 
       // Attorney
@@ -332,13 +319,13 @@ app.post('/scrape', async (req, res) => {
       const attorney   = noAttorney ? '' : (attHdr >= 0 ? c(attHdr + 1, 0) : '');
 
       // Release
-      const relHdr        = findRow('Release Date');
-      const relDat        = relHdr >= 0 ? relHdr + 1 : -1;
-      const releaseDate   = relDat >= 0 ? c(relDat, 0) : '';
-      const releaseOfficer= relDat >= 0 ? c(relDat, 1) : '';
-      const releasedTo    = relDat >= 0 ? c(relDat, 2) : '';
-      const notReleased   = bodyText.includes('Not Released');
-      const isReleased    = !notReleased && !location.toLowerCase().includes('jail');
+      const relHdr         = findRow('Release Date');
+      const relDat         = relHdr >= 0 ? relHdr + 1 : -1;
+      const releaseDate    = relDat >= 0 ? c(relDat, 0) : '';
+      const releaseOfficer = relDat >= 0 ? c(relDat, 1) : '';
+      const releasedTo     = relDat >= 0 ? c(relDat, 2) : '';
+      const notReleased    = bodyText.includes('Not Released');
+      const isReleased     = !notReleased && !location.toLowerCase().includes('jail');
 
       return {
         agency_id: agencyId, arrest_date_time: arrestDateTime,
@@ -347,7 +334,8 @@ app.post('/scrape', async (req, res) => {
         soid: soidVal, days_in_custody: daysInCustody,
         height, weight, hair, eyes,
         address, address_street: addrStreet, address_city: addrCity,
-        address_state: addrState, address_zip: addrZip, place_of_birth: placeOfBirth,
+        address_state: addrState, address_zip: addrZip,
+        place_of_birth: placeOfBirth,
         arresting_agency: arrestAgency, arrest_officer: arrestOfficer,
         location_of_arrest: locOfArrest, serial_number: serialNumber,
         charges, charges_description: chargesDesc, charge_type: chargeTypes,
@@ -414,7 +402,7 @@ app.post('/scrape', async (req, res) => {
       charges_detail:      detail.charges || []
     };
 
-    console.log(`[scrape] ✅ ${data.full_name} | event_id: ${data.event_id} | charges: ${data.charges.substring(0,50)}`);
+    console.log(`[scrape] ✅ ${data.full_name} | event_id: ${data.event_id} | charges: ${data.charges.substring(0, 60)}`);
 
     return res.json({
       success:     true,
@@ -428,7 +416,12 @@ app.post('/scrape', async (req, res) => {
   } catch (err) {
     if (browser) await browser.close().catch(() => {});
     console.error(`[scrape] ❌ "${name || soid}": ${err.message}`);
-    return res.status(500).json({ success: false, found: false, error: err.message, name: name || soid || '' });
+    return res.status(500).json({
+      success: false,
+      found:   false,
+      error:   err.message,
+      name:    name || soid || ''
+    });
   }
 });
 
@@ -441,28 +434,33 @@ app.post('/admissions', async (req, res) => {
   try {
     browser = await launchBrowser();
     const page = await browser.newPage();
-    await page.setExtraHTTPHeaders({ 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' });
+    await page.setExtraHTTPHeaders({
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+    });
 
-    await page.goto(BASE_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    await page.goto(BASE_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
 
     const admBtn = await page.$('input[value="Admissions"], a:has-text("Admissions")');
     if (!admBtn) throw new Error('Admissions button not found');
 
     await Promise.all([
-      page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 20000 }),
+      page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 60000 }),
       admBtn.click()
     ]);
 
-    await page.waitForSelector('table', { timeout: 15000 });
+    await page.waitForSelector('table', { timeout: 20000 });
 
     const inmates = await page.evaluate(() => {
       return Array.from(document.querySelectorAll('table tr')).slice(1).map(row => {
         const cells = Array.from(row.querySelectorAll('td')).map(c => c.innerText.trim());
         if (!cells[1] || cells[1].length < 2) return null;
         return {
-          name: cells[1] || '', dob: cells[2] || '',
-          race: cells[3] || '', sex: cells[4] || '',
-          location: cells[5] || '', soid: cells[6] || '',
+          name:            cells[1] || '',
+          dob:             cells[2] || '',
+          race:            cells[3] || '',
+          sex:             cells[4] || '',
+          location:        cells[5] || '',
+          soid:            cells[6] || '',
           days_in_custody: cells[7] || ''
         };
       }).filter(Boolean);
@@ -489,13 +487,23 @@ function buildBasicData(summaryRow, originalName) {
   const sexRaw  = (summaryRow.sex || '').trim();
   const sex     = sexRaw === 'M' ? 'Male' : sexRaw === 'F' ? 'Female' : sexRaw;
   return {
-    event_id: eventId, full_name: summaryRow.name || '',
-    original_name: originalName || '', charges: '', charge_type: '',
-    county: 'Cobb', custody_status: summaryRow.location || '',
-    is_released: !(summaryRow.location || '').toLowerCase().includes('jail'),
-    bonding_amount: '', bonding_company: '', booking_date: '',
-    date_of_birth: summaryRow.dob || '', days_in_custody: summaryRow.days_in_custody || '',
-    race, sex, processed: false, locked: false, scraped_at: new Date().toISOString()
+    event_id:        eventId,
+    full_name:       summaryRow.name || '',
+    original_name:   originalName || '',
+    charges:         '',
+    charge_type:     '',
+    county:          'Cobb',
+    custody_status:  summaryRow.location || '',
+    is_released:     !(summaryRow.location || '').toLowerCase().includes('jail'),
+    bonding_amount:  '',
+    bonding_company: '',
+    booking_date:    '',
+    date_of_birth:   summaryRow.dob || '',
+    days_in_custody: summaryRow.days_in_custody || '',
+    race, sex,
+    processed:       false,
+    locked:          false,
+    scraped_at:      new Date().toISOString()
   };
 }
 
