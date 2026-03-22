@@ -1,0 +1,21 @@
+{
+  "name": "cobb-county-scraper",
+  "version": "1.0.0",
+  "description": "Playwright microservice for Cobb County Sheriff inmate scraping",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "nodemon server.js",
+    "install-browsers": "npx playwright install chromium"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "playwright": "^1.42.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.3"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
