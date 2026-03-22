@@ -1,22 +1,14 @@
-# Use official Playwright image with browsers pre-installed
-FROM mcr.microsoft.com/playwright:v1.42.0-jammy
+# Use Apify's official Playwright Docker image — this includes Playwright + browsers pre-installed
+FROM apify/actor-node-playwright-chrome:20
 
-WORKDIR /app
-
-# Copy package files
+# Copy package files first
 COPY package*.json ./
 
 # Install dependencies
-RUN npm ci --only=production
+RUN npm install --omit=dev
 
-# Install Chromium browser
-RUN npx playwright install chromium
+# Copy the rest of the actor files
+COPY . ./
 
-# Copy application code
-COPY server.js ./
-
-# Expose port (Railway sets PORT env var automatically)
-EXPOSE 3000
-
-# Start the server
-CMD ["node", "server.js"]
+# Run the actor
+CMD npm start
