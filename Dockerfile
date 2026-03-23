@@ -1,25 +1,29 @@
 FROM mcr.microsoft.com/playwright:v1.42.0-jammy
 
+# Set working directory
 WORKDIR /app
 
-# Copy package files
-COPY package*.json ./
-
 # Install dependencies
-RUN npm ci --only=production
+COPY package*.json ./
+RUN npm ci --only=production && \
+    npx playwright install chromium && \
+    npm cache clean --force
 
-# Install Playwright browsers (Chromium only — smaller image)
-RUN npx playwright install chromium --with-deps
+# Copy source code
+COPY . .
 
-# Copy source
-COPY index.js ./
+# Build TypeScript
+RUN npm run build
 
-# Railway sets PORT automatically
-ENV PORT=3000
+# Expose port
 EXPOSE 3000
 
-# Health check so Railway knows when the service is ready
-HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
-  CMD node -e "require('http').get('http://localhost:3000/health', r => process.exit(r.statusCode === 200 ? 0 : 1)).on('error', () => process.exit(1))"
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
+  CMD node -e "require('http').get('http://localhost:3000/health', r => process.exit(r.statusCode === 200 ? 0 : 1))"
 
-CMD ["node", "index.js"]
+# Run as non-root user
+USER pwuser
+
+# Start application
+CMD ["npm", "start"]
