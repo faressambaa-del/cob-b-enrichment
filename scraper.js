@@ -17,9 +17,9 @@ async function scrapeInmate(name) {
   const proxy = getRandomProxy();
 
   const browser = await chromium.launch({
-    headless: true,
-    args: ['--no-sandbox']
-  });
+  headless: true,
+  args: ['--no-sandbox', '--disable-setuid-sandbox']
+});
 
   const context = await browser.newContext({
     proxy,
