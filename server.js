@@ -233,168 +233,184 @@ app.post('/scrape', async (req, res) => {
     console.log('[scrape] Detail loaded → ' + detailFinalUrl);
 
     // ── STEP 7: Parse full detail page ───────────────────────
-    // Sections: Booking Info | Personal | Physical | Address |
-    //           Arrest Circumstances | Charges | Bond | Release
+    // Root cause of empty fields: the page uses NESTED tables.
+    // querySelectorAll('table tr') returns rows from ALL nested
+    // tables mixed together, so row-index math breaks completely.
+    // Fix: search cell-by-cell using innerText on individual <td>
+    // elements, then grab the sibling/next-row cell for the value.
     const detail = await page.evaluate(() => {
-      const allRows = Array.from(document.querySelectorAll('table tr'))
-        .map(tr => Array.from(tr.querySelectorAll('td, th')).map(td => td.innerText.trim()))
-        .filter(r => r.some(c => c.length > 0));
+      const body = document.body.innerText || '';
 
-      const cv = (r, col) => ((allRows[r] || [])[col] || '').trim();
-
-      function findRow(label) {
-        for (let i = 0; i < allRows.length; i++) {
-          if ((allRows[i][0] || '').toLowerCase() === label.toLowerCase()) return i;
-        }
-        return -1;
-      }
-      function findRowP(label) {
-        for (let i = 0; i < allRows.length; i++) {
-          if ((allRows[i][0] || '').toLowerCase().includes(label.toLowerCase())) return i;
-        }
-        return -1;
-      }
-      function findCell(label) {
-        for (let i = 0; i < allRows.length; i++) {
-          for (let j = 0; j < (allRows[i] || []).length; j++) {
-            if ((allRows[i][j] || '').toLowerCase() === label.toLowerCase())
-              return { r: i, c: j };
+      // Core helper: find a <td> whose trimmed text exactly matches
+      // label, then return the text of the next sibling <td> in the
+      // same <tr>, OR the first <td> of the next <tr>.
+      function getValueAfterLabel(label) {
+        const tds = Array.from(document.querySelectorAll('td, th'));
+        for (let i = 0; i < tds.length; i++) {
+          const text = (tds[i].innerText || '').trim();
+          if (text.toLowerCase() === label.toLowerCase()) {
+            // Try next sibling td in same row first
+            let sib = tds[i].nextElementSibling;
+            while (sib) {
+              if (sib.tagName === 'TD' || sib.tagName === 'TH') {
+                const val = (sib.innerText || '').trim();
+                if (val) return val;
+              }
+              sib = sib.nextElementSibling;
+            }
+            // Try first td of the next tr
+            const tr = tds[i].closest('tr');
+            if (tr) {
+              const nextTr = tr.nextElementSibling;
+              if (nextTr) {
+                const firstTd = nextTr.querySelector('td, th');
+                if (firstTd) return (firstTd.innerText || '').trim();
+              }
+            }
           }
         }
-        return null;
+        return '';
       }
-      function findCellP(label) {
-        for (let i = 0; i < allRows.length; i++) {
-          for (let j = 0; j < (allRows[i] || []).length; j++) {
-            if ((allRows[i][j] || '').toLowerCase().includes(label.toLowerCase()))
-              return { r: i, c: j };
+
+      // Like getValueAfterLabel but returns ALL sibling tds in the
+      // next data row as an array — used for multi-column data rows.
+      function getRowAfterLabel(label) {
+        const tds = Array.from(document.querySelectorAll('td, th'));
+        for (let i = 0; i < tds.length; i++) {
+          const text = (tds[i].innerText || '').trim();
+          if (text.toLowerCase() === label.toLowerCase()) {
+            const tr = tds[i].closest('tr');
+            if (tr) {
+              const nextTr = tr.nextElementSibling;
+              if (nextTr) {
+                return Array.from(nextTr.querySelectorAll('td, th'))
+                  .map(td => (td.innerText || '').trim());
+              }
+            }
           }
         }
-        return null;
+        return [];
       }
 
       // ── Booking Information ──────────────────────────────────
-      const bHdr = findRow('Agency ID');
-      const bDat = bHdr >= 0 ? bHdr + 1 : -1;
-      const agencyId        = bDat >= 0 ? cv(bDat, 0) : '';
-      const arrestDateTime  = bDat >= 0 ? cv(bDat, 1) : '';
-      const bookingStarted  = bDat >= 0 ? cv(bDat, 2) : '';
-      const bookingComplete = bDat >= 0 ? cv(bDat, 3) : '';
+      // Header row: Agency ID | Arrest Date/Time | Booking Started | Booking Complete
+      const bookRow      = getRowAfterLabel('Agency ID');
+      const agencyId        = bookRow[0] || '';
+      const arrestDateTime  = bookRow[1] || '';
+      const bookingStarted  = bookRow[2] || '';
+      const bookingComplete = bookRow[3] || '';
 
       // ── Personal Information ─────────────────────────────────
-      const pHdr = findRow('Name');
-      const pDat = pHdr >= 0 ? pHdr + 1 : -1;
-      const fullName      = pDat >= 0 ? cv(pDat, 0) : '';
-      const dob           = pDat >= 0 ? cv(pDat, 1) : '';
-      const raceSex       = pDat >= 0 ? cv(pDat, 2) : '';
-      const location      = pDat >= 0 ? cv(pDat, 3) : '';
-      const soidVal       = pDat >= 0 ? cv(pDat, 4) : '';
-      const daysInCustody = pDat >= 0 ? cv(pDat, 5) : '';
+      // Header row: Name | DOB | Race/Sex | Location | SOID | Days in Custody
+      const persRow     = getRowAfterLabel('Name');
+      const fullName      = persRow[0] || '';
+      const dob           = persRow[1] || '';
+      const raceSex       = persRow[2] || '';
+      const location      = persRow[3] || '';
+      const soidVal       = persRow[4] || '';
+      const daysInCustody = persRow[5] || '';
 
       // ── Physical ─────────────────────────────────────────────
-      const physHdr = findRow('Height');
-      const physDat = physHdr >= 0 ? physHdr + 1 : -1;
-      let height    = physDat >= 0 ? cv(physDat, 0) : '';
-      const weight  = physDat >= 0 ? cv(physDat, 1) : '';
-      const hair    = physDat >= 0 ? cv(physDat, 2) : '';
-      const eyes    = physDat >= 0 ? cv(physDat, 3) : '';
+      // Header row: Height | Weight | Hair | Eyes
+      const physRow = getRowAfterLabel('Height');
+      let height    = physRow[0] || '';
+      const weight  = physRow[1] || '';
+      const hair    = physRow[2] || '';
+      const eyes    = physRow[3] || '';
+      // Convert raw height e.g. "500" -> "5'00\"", "508" -> "5'08\""
       if (/^\d{3,4}$/.test(height)) {
         const h = height.padStart(3, '0');
-        height = `${h[0]}'${h.slice(1)}"`;
+        height = h[0] + "'" + h.slice(1) + '"';
       }
 
       // ── Address ──────────────────────────────────────────────
-      const aHdr       = findRow('Address');
-      const aDat       = aHdr >= 0 ? aHdr + 1 : -1;
-      const addrStreet = aDat >= 0 ? cv(aDat, 0) : '';
-      const addrCity   = aDat >= 0 ? cv(aDat, 1) : '';
-      const addrState  = aDat >= 0 ? cv(aDat, 2) : '';
-      const addrZip    = aDat >= 0 ? cv(aDat, 3) : '';
+      // Header row: Address | City | State | Zip
+      const addrRow    = getRowAfterLabel('Address');
+      const addrStreet = addrRow[0] || '';
+      const addrCity   = addrRow[1] || '';
+      const addrState  = addrRow[2] || '';
+      const addrZip    = addrRow[3] || '';
       const address    = [addrStreet, addrCity, addrState, addrZip].filter(Boolean).join(', ');
 
       // ── Place of Birth ────────────────────────────────────────
-      const pobHdr       = findRow('Place of Birth');
-      const placeOfBirth = pobHdr >= 0 ? cv(pobHdr, 1) : '';
+      const placeOfBirth = getValueAfterLabel('Place of Birth');
 
       // ── Arrest Circumstances ─────────────────────────────────
-      const arHdr         = findRow('Arrest Agency');
-      const arDat         = arHdr >= 0 ? arHdr + 1 : -1;
-      const arrestAgency  = arDat >= 0 ? cv(arDat, 0) : '';
-      const arrestOfficer = arDat >= 0 ? cv(arDat, 1) : '';
-      const locOfArrest   = arDat >= 0 ? cv(arDat, 2) : '';
-      const serialNumber  = arDat >= 0 ? cv(arDat, 3) : '';
+      // Header row: Arrest Agency | Officer | Location of Arrest | Serial #
+      const arrestRow     = getRowAfterLabel('Arrest Agency');
+      const arrestAgency  = arrestRow[0] || '';
+      const arrestOfficer = arrestRow[1] || '';
+      const locOfArrest   = arrestRow[2] || '';
+      const serialNumber  = arrestRow[3] || '';
 
-      // ── Warrant / Case ────────────────────────────────────────
-      const wCell   = findCell('Warrant');
-      const warrant = wCell ? cv(wCell.r, wCell.c + 1) : '';
-      const csCell  = findCell('Case');
-      const caseNum = csCell ? cv(csCell.r, csCell.c + 1) : '';
-      const oCell   = findCell('OTN');
-      const otn     = oCell ? cv(oCell.r, oCell.c + 1) : '';
+      // ── Warrant / Case / OTN ─────────────────────────────────
+      const warrant = getValueAfterLabel('Warrant');
+      const caseNum = getValueAfterLabel('Case');
+      const otn     = getValueAfterLabel('OTN');
 
-      // ── Charges (multiple rows) ───────────────────────────────
-      const chHdr   = findRow('Offense Date');
-      const baHdr   = findRow('Bond Amount');
+      // ── Charges ───────────────────────────────────────────────
+      // Find all rows between 'Offense Date' header and 'Bond Amount' section
+      // Each charge row: Offense Date | Code Section | Description | Type | Counts | Bond
       const charges = [];
-      if (chHdr >= 0) {
-        const end = baHdr >= 0 ? baHdr : chHdr + 25;
-        for (let r = chHdr + 1; r < end; r++) {
-          const row  = allRows[r] || [];
-          const desc = (row[2] || '').trim();
+      const allTrs  = Array.from(document.querySelectorAll('tr'));
+      let inCharges = false;
+      for (const tr of allTrs) {
+        const cells = Array.from(tr.querySelectorAll('td, th')).map(c => (c.innerText || '').trim());
+        const rowText = cells.join('|').toLowerCase();
+        if (!inCharges && rowText.includes('offense date') && rowText.includes('code section')) {
+          inCharges = true;
+          continue;
+        }
+        if (inCharges) {
+          // Stop at Bond Amount or Release Information section headers
+          if (rowText.includes('bond amount') || rowText.includes('release information') ||
+              rowText.includes('release date') || rowText.includes('attorney')) break;
+          const desc = cells[2] || '';
           if (desc && desc.toLowerCase() !== 'n/a' && desc.length > 2 &&
-              !['offense date','description','type','warrant','case'].includes(desc.toLowerCase())) {
+              !['offense date','description','type','warrant','case','disposition','counts','bond'].includes(desc.toLowerCase())) {
             charges.push({
-              offense_date: (row[0] || '').trim(),
-              code_section: (row[1] || '').trim(),
+              offense_date: cells[0] || '',
+              code_section: cells[1] || '',
               description:  desc,
-              type:         (row[3] || '').trim(),
-              counts:       (row[4] || '').trim(),
-              bond:         (row[5] || '').trim()
+              type:         cells[3] || '',
+              counts:       cells[4] || '',
+              bond:         cells[5] || ''
             });
           }
         }
       }
-      const chargesDesc = charges.map(ch => ch.description).join('; ');
-      const chargeTypes = [...new Set(charges.map(ch => {
-        if (ch.type.toLowerCase().includes('felony'))      return 'Felony';
-        if (ch.type.toLowerCase().includes('misdemeanor')) return 'Misdemeanor';
+      const chargesDesc  = charges.map(ch => ch.description).join('; ');
+      const chargeTypes  = [...new Set(charges.map(ch => {
+        if ((ch.type || '').toLowerCase().includes('felony'))      return 'Felony';
+        if ((ch.type || '').toLowerCase().includes('misdemeanor')) return 'Misdemeanor';
         return ch.type;
       }).filter(Boolean))].join('; ');
 
       // ── Disposition ───────────────────────────────────────────
-      const dispCell    = findCell('Disposition');
-      const disposition = dispCell ? cv(dispCell.r, dispCell.c + 1) : '';
+      const disposition = getValueAfterLabel('Disposition');
 
-      // ── Bond ──────────────────────────────────────────────────
-      const baCell     = findCell('Bond Amount');
-      const totalBond  = baCell ? cv(baCell.r, baCell.c + 1) : '';
-      const bsCell     = findCellP('Bond Status');
-      const bondStatus = bsCell ? cv(bsCell.r, bsCell.c + 1) : '';
-      const bondingCo  = bsCell ? cv(bsCell.r, bsCell.c + 2) : '';
+      // ── Bond ─────────────────────────────────────────────────
+      const bondRow    = getRowAfterLabel('Bond Status');
+      const totalBond  = getValueAfterLabel('Bond Amount');
+      const bondStatus = bondRow[1] || '';
+      const bondingCo  = bondRow[2] || '';
 
-      // ── Bondsman / Case-Warrant ───────────────────────────────
-      const cwCell     = findCellP('Case/Warrant');
-      let caseWarrant  = '';
-      let bondsmanName = '';
-      if (cwCell) {
-        caseWarrant  = cv(cwCell.r + 1, cwCell.c);
-        bondsmanName = cv(cwCell.r + 1, cwCell.c + 1);
-      }
+      // ── Bondsman ─────────────────────────────────────────────
+      const bondsmanRow  = getRowAfterLabel('Case/Warrant');
+      const caseWarrant  = bondsmanRow[0] || '';
+      const bondsmanName = bondsmanRow[1] || '';
 
       // ── Attorney ──────────────────────────────────────────────
-      const bodyText   = document.body.innerText || '';
-      const noAttorney = bodyText.includes('No Attorney of Record');
-      const attHdr     = findRowP('Attorney');
-      const attorney   = noAttorney ? '' : (attHdr >= 0 ? cv(attHdr + 1, 0) : '');
+      const noAttorney = body.includes('No Attorney of Record');
+      const attorney   = noAttorney ? '' : getValueAfterLabel('Attorney');
 
       // ── Release Information ───────────────────────────────────
-      const relHdr         = findRow('Release Date');
-      const relDat         = relHdr >= 0 ? relHdr + 1 : -1;
-      const releaseDate    = relDat >= 0 ? cv(relDat, 0) : '';
-      const releaseOfficer = relDat >= 0 ? cv(relDat, 1) : '';
-      const releasedTo     = relDat >= 0 ? cv(relDat, 2) : '';
-      const notReleased    = bodyText.includes('Not Released');
-      const isReleased     = !notReleased && !location.toLowerCase().includes('jail');
+      const relRow         = getRowAfterLabel('Release Date');
+      const releaseDate    = relRow[0] || '';
+      const releaseOfficer = relRow[1] || '';
+      const releasedTo     = relRow[2] || '';
+      const notReleased    = body.includes('Not Released');
+      const isReleased     = !notReleased && !(location || '').toLowerCase().includes('jail');
 
       return {
         agency_id: agencyId, arrest_date_time: arrestDateTime,
