@@ -1,11 +1,14 @@
 [build]
-builder = "dockerfile"
-dockerfilePath = "Dockerfile"
+builder = "DOCKERFILE"
 
 [deploy]
-restartPolicyType = "on_failure"
+startCommand = "npm start"
+healthcheckPath = "/health"
+healthcheckTimeout = 100
+restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 3
 
-[deploy.healthcheck]
-path = "/health"
-timeout = 30
+[env]
+PORT = "3000"
+NODE_ENV = "production"
+REQUEST_TIMEOUT_MS = "45000"
