@@ -106,22 +106,36 @@ app.post('/scrape', async (req, res) => {
     page.setDefaultTimeout(300000);
     page.setDefaultNavigationTimeout(300000);
 
-    // ── STEP 1: Jump directly to results URL ─────────────────
-    // The homepage (BASE_URL /) times out from Railway because the
-    // old ASP server drops non-browser connections on the root path.
-    // Sub-page URLs work fine — this is exactly what the browser
-    // submits after you click Search on enter_name.shtm.
-    const searchParam = soid
-      ? `soid=${encodeURIComponent(soid)}&inmate_name=&serial=&qry=Inquiry`
-      : `soid=&inmate_name=${encodeURIComponent(searchName).replace(/%20/g, '+')}&serial=&qry=Inquiry`;
-    const resultsUrl = `${BASE_URL}/inquiry.asp?${searchParam}`;
+    // ── STEP 1: Establish session via enter_name.shtm ───────
+    // The site uses ASP session cookies. Without a valid session,
+    // the results page loads but all form actions and booking links
+    // are stripped — that's why forms=[] and BOOKING_ID is missing.
+    // Fix: visit the search form page first to get a session cookie,
+    // then submit the form properly so the results page is fully hydrated.
 
-    console.log(`[scrape] GET ${resultsUrl}`);
-    await page.goto(resultsUrl, {
-      waitUntil: 'domcontentloaded',
-      timeout: 120000
+    const searchFormUrl = BASE_URL + '/enter_name.shtm';
+    console.log('[scrape] Establishing session: ' + searchFormUrl);
+    await page.goto(searchFormUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    console.log('[scrape] Session page loaded → ' + page.url());
+
+    // Fill the NAME field and submit the form
+    await page.fill('input[name="name"], input[name="NAME"], input[name="inmate_name"]',
+      soid ? '' : searchName);
+    if (soid) {
+      await page.fill('input[name="soid"], input[name="SOID"]', soid).catch(() => {});
+    }
+
+    // Set dropdown to Inquiry
+    await page.selectOption('select', { label: 'Inquiry' }).catch(async () => {
+      await page.selectOption('select', 'Inquiry').catch(() => {});
     });
-    console.log(`[scrape] Results loaded → ${page.url()}`);
+
+    console.log('[scrape] Submitting search form for: ' + searchName);
+    await Promise.all([
+      page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 60000 }),
+      page.click('input[value="Search"]')
+    ]);
+    console.log('[scrape] Results loaded → ' + page.url());
 
     // ── STEP 5: Check for results ─────────────────────────────
     const bodyText = await page.textContent('body');
@@ -166,63 +180,74 @@ app.post('/scrape', async (req, res) => {
 
     console.log(`[scrape] Found: "${summaryRow.name}" | SOID: ${summaryRow.soid} | Location: ${summaryRow.location}`);
 
-    // ── STEP 6: Get BOOKING_ID by clicking the button directly ─
-    // Forms array is empty — the button is not inside a <form>.
-    // It could be an <a> tag, a JS onclick, or rendered inside a
-    // <frameset>. Strategy: dump the full raw HTML of the results
-    // page so we can see exactly what element holds the link,
-    // then click whatever it is and follow the navigation.
+    // ── STEP 6: Click Last Known Booking with active session ─
+    // Now that we have a real ASP session (established via form submit),
+    // the results page is fully rendered with the booking form/links.
+    // We try multiple strategies in order of reliability.
 
-    // First: dump the entire page HTML for diagnosis
-    const pageHtml = await page.content();
-    console.log('[DEBUG] Results page HTML (first 3000 chars): ' + pageHtml.substring(0, 3000));
-
-    // Try every possible way to find and activate the booking link
     let detailFinalUrl = '';
 
-    // Strategy A: find any <a> whose href contains InmDetails
-    const inmLink = await page.$('a[href*="InmDetails"], a[href*="inmdetails"]');
+    // Log ALL elements for complete visibility
+    const pageElements = await page.evaluate(() => {
+      const forms = Array.from(document.querySelectorAll('form')).map(f => ({
+        action: f.action, method: f.method,
+        inputs: Array.from(f.querySelectorAll('input')).map(i => ({ type: i.type, name: i.name, value: i.value }))
+      }));
+      const links = Array.from(document.querySelectorAll('a')).map(a => ({ text: (a.innerText||'').trim(), href: a.href, onclick: a.getAttribute('onclick')||'' }));
+      const buttons = Array.from(document.querySelectorAll('input[type="submit"],button')).map(b => ({ value: b.value||b.innerText, onclick: b.getAttribute('onclick')||'', formAction: b.form ? b.form.action : '' }));
+      return { forms, links, buttons };
+    });
+    console.log('[DEBUG] Page elements after session: ' + JSON.stringify(pageElements));
+
+    // Strategy 1: <a href> containing InmDetails
+    const inmLink = await page.$('a[href*="InmDetails"], a[href*="inmdetails"], a[href*="Inm"]');
     if (inmLink) {
       const href = await inmLink.getAttribute('href');
-      console.log('[scrape] Found InmDetails <a> href: ' + href);
+      console.log('[scrape] Strategy 1 — InmDetails <a>: ' + href);
       const fullUrl = href.startsWith('http') ? href : BASE_URL + '/' + href.replace(/^\//, '');
       await page.goto(fullUrl, { waitUntil: 'domcontentloaded', timeout: 120000 });
       detailFinalUrl = page.url();
 
-    // Strategy B: click any element with "Last Known Booking" text and wait for navigation
+    // Strategy 2: form whose action contains InmDetails — extract hidden fields and POST
+    } else if (pageElements.forms.some(f => (f.action||'').toLowerCase().includes('inmdetails'))) {
+      const bookingForm = pageElements.forms.find(f => (f.action||'').toLowerCase().includes('inmdetails'));
+      const bookingId  = (bookingForm.inputs.find(i => i.name.toUpperCase() === 'BOOKING_ID') || {}).value || '';
+      const soidVal    = (bookingForm.inputs.find(i => i.name.toUpperCase() === 'SOID') || {}).value || summaryRow.soid;
+      console.log('[scrape] Strategy 2 — form POST: soid=' + soidVal + ' BOOKING_ID=' + bookingId);
+      const detailUrl = BASE_URL + '/InmDetails.asp?soid=' + encodeURIComponent(soidVal) + '&BOOKING_ID=' + encodeURIComponent(bookingId);
+      await page.goto(detailUrl, { waitUntil: 'domcontentloaded', timeout: 120000 });
+      detailFinalUrl = page.url();
+
+    // Strategy 3: submit button with booking text — click it with the session active
     } else {
-      console.log('[scrape] No <a> link found — trying click on any booking element');
+      console.log('[scrape] Strategy 3 — clicking submit button with active session');
       try {
-        // Cast a wide net — any element containing booking-related text
-        const bookingEl = await page.$(
-          'input[value*="Last"], input[value*="Booking"], input[value*="booking"], ' +
-          'a:has-text("Last"), button:has-text("Booking"), td input[type="submit"]'
-        );
-        if (bookingEl) {
-          console.log('[scrape] Found booking element — clicking');
+        // Match the exact "Last Known Booking" input submit button
+        const btn = page.locator('input[type="submit"]').filter({ hasText: /booking/i }).first();
+        const btnCount = await btn.count();
+        if (btnCount > 0) {
           await Promise.all([
             page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 60000 }),
-            bookingEl.click()
+            btn.click()
           ]);
           detailFinalUrl = page.url();
         } else {
-          // Strategy C: find ALL clickable elements and log them for diagnosis
-          const allClickable = await page.evaluate(() => {
-            const els = Array.from(document.querySelectorAll('a, input[type="submit"], button'));
-            return els.map(el => ({
-              tag:   el.tagName,
-              text:  (el.innerText || el.value || '').trim().substring(0, 80),
-              href:  el.href || '',
-              onclick: el.getAttribute('onclick') || ''
-            }));
-          });
-          console.log('[DEBUG] All clickable elements: ' + JSON.stringify(allClickable));
-          console.log('[scrape] No booking element found at all — returning summary only');
-          await browser.close();
-          return res.json({ success: true, found: true, data: buildBasicData(summaryRow, name || soid) });
+          // Last resort: click the first submit button in the results table
+          const firstSubmit = page.locator('table input[type="submit"]').first();
+          if (await firstSubmit.count() > 0) {
+            await Promise.all([
+              page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 60000 }),
+              firstSubmit.click()
+            ]);
+            detailFinalUrl = page.url();
+          } else {
+            console.log('[scrape] No booking button found — returning summary only');
+            await browser.close();
+            return res.json({ success: true, found: true, data: buildBasicData(summaryRow, name || soid) });
+          }
         }
       } catch (clickErr) {
-        console.log('[scrape] Click navigation error: ' + clickErr.message);
+        console.log('[scrape] Click error: ' + clickErr.message);
         await browser.close();
         return res.json({ success: true, found: true, data: buildBasicData(summaryRow, name || soid) });
       }
@@ -230,9 +255,8 @@ app.post('/scrape', async (req, res) => {
 
     console.log('[scrape] Detail loaded → ' + detailFinalUrl);
 
-    // Bail if we hit error page
     if (!detailFinalUrl || detailFinalUrl.includes('Error_Page') || detailFinalUrl.includes('error_page')) {
-      console.log('[scrape] Landed on error page — returning summary only. URL: ' + detailFinalUrl);
+      console.log('[scrape] Error page reached — returning summary only');
       await browser.close();
       return res.json({ success: true, found: true, data: buildBasicData(summaryRow, name || soid) });
     }
