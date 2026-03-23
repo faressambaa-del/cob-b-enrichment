@@ -1,12 +1,13 @@
 FROM mcr.microsoft.com/playwright:v1.42.0-jammy
 
-# Set working directory
 WORKDIR /app
 
-# Install dependencies
+# Copy package files first for better caching
 COPY package*.json ./
-RUN npm ci --only=production && \
-    npx playwright install chromium && \
+
+# Use npm install (works without lockfile) + install Playwright browsers
+RUN npm install --omit=dev && \
+    npx playwright install chromium --with-deps && \
     npm cache clean --force
 
 # Copy source code
@@ -22,7 +23,7 @@ EXPOSE 3000
 HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
   CMD node -e "require('http').get('http://localhost:3000/health', r => process.exit(r.statusCode === 200 ? 0 : 1))"
 
-# Run as non-root user
+# Run as non-root user (pwuser exists in Playwright base image)
 USER pwuser
 
 # Start application
