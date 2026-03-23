@@ -166,78 +166,73 @@ app.post('/scrape', async (req, res) => {
 
     console.log(`[scrape] Found: "${summaryRow.name}" | SOID: ${summaryRow.soid} | Location: ${summaryRow.location}`);
 
-    // ── STEP 6: Extract BOOKING_ID from results page forms ───
-    // The "Last Known Booking" button is an <input type="submit"> inside a <form>
-    // that POSTs to InmDetails.asp. We need soid + BOOKING_ID from hidden inputs.
-    // CRITICAL: BOOKING_ID cannot be empty — site returns Error_Page_Display.asp.
+    // ── STEP 6: Get BOOKING_ID by clicking the button directly ─
+    // Forms array is empty — the button is not inside a <form>.
+    // It could be an <a> tag, a JS onclick, or rendered inside a
+    // <frameset>. Strategy: dump the full raw HTML of the results
+    // page so we can see exactly what element holds the link,
+    // then click whatever it is and follow the navigation.
 
-    // First dump ALL forms and inputs so we know exactly what's on the page
-    const formDump = await page.evaluate(() => {
-      const forms = Array.from(document.querySelectorAll('form'));
-      return forms.map(f => ({
-        action:  f.action || f.getAttribute('action') || '',
-        method:  f.method || '',
-        inputs:  Array.from(f.querySelectorAll('input')).map(i => ({
-          type:  i.type,
-          name:  i.name,
-          value: i.value
-        }))
-      }));
-    });
-    console.log('[DEBUG] Forms on results page: ' + JSON.stringify(formDump));
+    // First: dump the entire page HTML for diagnosis
+    const pageHtml = await page.content();
+    console.log('[DEBUG] Results page HTML (first 3000 chars): ' + pageHtml.substring(0, 3000));
 
-    // Extract the booking detail URL from the form data
-    let bookingId  = '';
-    let bookingSoid = (summaryRow.soid || '').trim();
+    // Try every possible way to find and activate the booking link
+    let detailFinalUrl = '';
 
-    for (const form of formDump) {
-      const action = (form.action || '').toLowerCase();
-      if (action.includes('inmdetails') || action.includes('inm_details')) {
-        for (const inp of form.inputs) {
-          const n = (inp.name || '').toUpperCase();
-          if (n === 'BOOKING_ID' && inp.value) bookingId   = inp.value;
-          if (n === 'SOID'       && inp.value) bookingSoid = inp.value;
+    // Strategy A: find any <a> whose href contains InmDetails
+    const inmLink = await page.$('a[href*="InmDetails"], a[href*="inmdetails"]');
+    if (inmLink) {
+      const href = await inmLink.getAttribute('href');
+      console.log('[scrape] Found InmDetails <a> href: ' + href);
+      const fullUrl = href.startsWith('http') ? href : BASE_URL + '/' + href.replace(/^\//, '');
+      await page.goto(fullUrl, { waitUntil: 'domcontentloaded', timeout: 120000 });
+      detailFinalUrl = page.url();
+
+    // Strategy B: click any element with "Last Known Booking" text and wait for navigation
+    } else {
+      console.log('[scrape] No <a> link found — trying click on any booking element');
+      try {
+        // Cast a wide net — any element containing booking-related text
+        const bookingEl = await page.$(
+          'input[value*="Last"], input[value*="Booking"], input[value*="booking"], ' +
+          'a:has-text("Last"), button:has-text("Booking"), td input[type="submit"]'
+        );
+        if (bookingEl) {
+          console.log('[scrape] Found booking element — clicking');
+          await Promise.all([
+            page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 60000 }),
+            bookingEl.click()
+          ]);
+          detailFinalUrl = page.url();
+        } else {
+          // Strategy C: find ALL clickable elements and log them for diagnosis
+          const allClickable = await page.evaluate(() => {
+            const els = Array.from(document.querySelectorAll('a, input[type="submit"], button'));
+            return els.map(el => ({
+              tag:   el.tagName,
+              text:  (el.innerText || el.value || '').trim().substring(0, 80),
+              href:  el.href || '',
+              onclick: el.getAttribute('onclick') || ''
+            }));
+          });
+          console.log('[DEBUG] All clickable elements: ' + JSON.stringify(allClickable));
+          console.log('[scrape] No booking element found at all — returning summary only');
+          await browser.close();
+          return res.json({ success: true, found: true, data: buildBasicData(summaryRow, name || soid) });
         }
-        if (bookingId) break;
+      } catch (clickErr) {
+        console.log('[scrape] Click navigation error: ' + clickErr.message);
+        await browser.close();
+        return res.json({ success: true, found: true, data: buildBasicData(summaryRow, name || soid) });
       }
     }
 
-    // If not found in form actions, scan ALL inputs for BOOKING_ID
-    if (!bookingId) {
-      for (const form of formDump) {
-        for (const inp of form.inputs) {
-          if ((inp.name || '').toUpperCase() === 'BOOKING_ID' && inp.value) {
-            bookingId   = inp.value;
-            // Also grab soid from same form
-            const soidInp = form.inputs.find(i => (i.name || '').toUpperCase() === 'SOID');
-            if (soidInp && soidInp.value) bookingSoid = soidInp.value;
-            break;
-          }
-        }
-        if (bookingId) break;
-      }
-    }
-
-    console.log('[scrape] BOOKING_ID=' + bookingId + ' | SOID=' + bookingSoid);
-
-    if (!bookingId) {
-      console.log('[scrape] ERROR: No BOOKING_ID found — cannot navigate to detail page');
-      console.log('[scrape] Returning summary-only data for: ' + summaryRow.name);
-      await browser.close();
-      return res.json({ success: true, found: true, data: buildBasicData(summaryRow, name || soid) });
-    }
-
-    // Build the GET URL — InmDetails.asp accepts GET with soid + BOOKING_ID
-    const detailUrl = BASE_URL + '/InmDetails.asp?soid=' + encodeURIComponent(bookingSoid) + '&BOOKING_ID=' + encodeURIComponent(bookingId);
-    console.log('[scrape] Navigating to: ' + detailUrl);
-    await page.goto(detailUrl, { waitUntil: 'domcontentloaded', timeout: 120000 });
-
-    const detailFinalUrl = page.url();
     console.log('[scrape] Detail loaded → ' + detailFinalUrl);
 
-    // Bail out if we still hit the error page
-    if (detailFinalUrl.includes('Error_Page') || detailFinalUrl.includes('error_page')) {
-      console.log('[scrape] ERROR: Landed on error page even with BOOKING_ID=' + bookingId);
+    // Bail if we hit error page
+    if (!detailFinalUrl || detailFinalUrl.includes('Error_Page') || detailFinalUrl.includes('error_page')) {
+      console.log('[scrape] Landed on error page — returning summary only. URL: ' + detailFinalUrl);
       await browser.close();
       return res.json({ success: true, found: true, data: buildBasicData(summaryRow, name || soid) });
     }
