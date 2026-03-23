@@ -2,18 +2,18 @@ FROM mcr.microsoft.com/playwright:v1.42.0-jammy
 
 WORKDIR /app
 
-# Copy lockfile + package.json for deterministic installs
+# Copy package files
 COPY package*.json ./
 
-# Clean install using lockfile + install Playwright browsers
-RUN npm ci --omit=dev && \
+# Use npm install (doesn't require lockfile)
+RUN npm install --omit=dev && \
     npx playwright install chromium --with-deps && \
     npm cache clean --force
 
-# Copy source
+# Copy source code
 COPY . .
 
-# Build
+# Build TypeScript
 RUN npm run build
 
 # Expose port
@@ -23,7 +23,7 @@ EXPOSE 3000
 HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
   CMD node -e "require('http').get('http://localhost:3000/health', r => process.exit(r.statusCode === 200 ? 0 : 1))"
 
-# Security: run as non-root
+# Run as non-root
 USER pwuser
 
 CMD ["npm", "start"]
