@@ -232,6 +232,24 @@ app.post('/scrape', async (req, res) => {
     const detailFinalUrl = page.url();
     console.log('[scrape] Detail loaded → ' + detailFinalUrl);
 
+    // ── DEBUG: dump raw page HTML and innerText to diagnose blank fields ──
+    const debugDump = await page.evaluate(() => {
+      const allTds = Array.from(document.querySelectorAll('td, th'));
+      const cellTexts = allTds.map((td, i) => i + ': [' + (td.innerText || '').trim().replace(/\n/g, '|') + ']');
+      return {
+        url:        window.location.href,
+        title:      document.title,
+        bodySnippet: (document.body.innerText || '').substring(0, 2000),
+        tdCount:    allTds.length,
+        cells:      cellTexts.slice(0, 80)   // first 80 cells
+      };
+    });
+    console.log('[DEBUG] URL: ' + debugDump.url);
+    console.log('[DEBUG] Title: ' + debugDump.title);
+    console.log('[DEBUG] TD count: ' + debugDump.tdCount);
+    console.log('[DEBUG] Body snippet: ' + debugDump.bodySnippet.replace(/\n/g, ' | ').substring(0, 500));
+    console.log('[DEBUG] Cells: ' + debugDump.cells.join(' \n'));
+
     // ── STEP 7: Parse full detail page ───────────────────────
     // Root cause of empty fields: the page uses NESTED tables.
     // querySelectorAll('table tr') returns rows from ALL nested
