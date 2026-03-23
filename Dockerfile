@@ -1,13 +1,16 @@
-FROM mcr.microsoft.com/playwright:v1.58.2-jammy
+FROM mcr.microsoft.com/playwright:v1.42.0-jammy
 
 WORKDIR /app
 
-COPY package*.json ./
+COPY package.json ./
 
-RUN npm install
+RUN npm install --only=production
 
-COPY . .
+RUN npx playwright install chromium
 
+COPY server.js ./
+
+ENV PORT=3000
 EXPOSE 3000
 
-CMD ["npm", "start"]
+CMD ["node", "server.js"]
