@@ -110,7 +110,7 @@ app.post('/scrape', async (req, res) => {
     console.log(`[scrape] Loading ${BASE_URL} ...`);
     await page.goto(BASE_URL, {
       waitUntil: 'domcontentloaded',
-      timeout: 120000
+      timeout: 300000
     });
     console.log(`[scrape] Loaded → ${page.url()}`);
 
