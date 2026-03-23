@@ -166,71 +166,81 @@ app.post('/scrape', async (req, res) => {
 
     console.log(`[scrape] Found: "${summaryRow.name}" | SOID: ${summaryRow.soid} | Location: ${summaryRow.location}`);
 
-    // ── STEP 6: Navigate to Last Known Booking detail page ───
-    // The "Last Known Booking" button is a styled <input type="submit"> inside a
-    // <form> that POSTs to InmDetails.asp with hidden soid + BOOKING_ID fields.
-    // We extract those hidden values and construct the GET URL directly.
-    // This is more reliable than clicking because Railway headless sometimes
-    // fails to resolve form POSTs on old ASP pages.
+    // ── STEP 6: Extract BOOKING_ID from results page forms ───
+    // The "Last Known Booking" button is an <input type="submit"> inside a <form>
+    // that POSTs to InmDetails.asp. We need soid + BOOKING_ID from hidden inputs.
+    // CRITICAL: BOOKING_ID cannot be empty — site returns Error_Page_Display.asp.
 
-    const detailUrl = await page.evaluate((baseUrl) => {
-      // Strategy 1: find a <form> whose action contains InmDetails
+    // First dump ALL forms and inputs so we know exactly what's on the page
+    const formDump = await page.evaluate(() => {
       const forms = Array.from(document.querySelectorAll('form'));
-      for (const form of forms) {
-        const action = (form.action || form.getAttribute('action') || '').toLowerCase();
-        if (action.includes('inmdetails') || action.includes('inm_details') || action.includes('booking')) {
-          const soidInput    = form.querySelector('input[name="soid"], input[name="SOID"]');
-          const bookingInput = form.querySelector('input[name="BOOKING_ID"], input[name="booking_id"]');
-          if (soidInput && bookingInput) {
-            return baseUrl + '/InmDetails.asp?soid=' + encodeURIComponent(soidInput.value) + '&BOOKING_ID=' + encodeURIComponent(bookingInput.value);
-          }
-          if (form.action && form.action.includes('InmDetails')) return form.action;
-        }
-      }
-      // Strategy 2: any <a> linking to InmDetails
-      const links = Array.from(document.querySelectorAll('a[href*="InmDetails"], a[href*="inm"]'));
-      if (links.length > 0) return links[0].href;
-      // Strategy 3: any submit button with booking text, grab its form
-      const inputs = Array.from(document.querySelectorAll('input[type="submit"]'));
-      for (const inp of inputs) {
-        const val = (inp.value || '').toLowerCase();
-        if (val.includes('booking') || val.includes('last known') || val.includes('detail')) {
-          const form = inp.closest('form');
-          if (form) {
-            const soidInput    = form.querySelector('input[name="soid"], input[name="SOID"]');
-            const bookingInput = form.querySelector('input[name="BOOKING_ID"], input[name="booking_id"]');
-            if (soidInput && bookingInput) {
-              return baseUrl + '/InmDetails.asp?soid=' + encodeURIComponent(soidInput.value) + '&BOOKING_ID=' + encodeURIComponent(bookingInput.value);
-            }
-            if (form.action) return form.action;
-          }
-        }
-      }
-      // Debug: log all forms
-      const debug = forms.map(f => f.action + ' | ' + Array.from(f.querySelectorAll('input')).map(i => i.name+'='+i.value).join(','));
-      console.log('NO_DETAIL_FORM:' + debug.join(' || '));
-      return null;
-    }, BASE_URL);
+      return forms.map(f => ({
+        action:  f.action || f.getAttribute('action') || '',
+        method:  f.method || '',
+        inputs:  Array.from(f.querySelectorAll('input')).map(i => ({
+          type:  i.type,
+          name:  i.name,
+          value: i.value
+        }))
+      }));
+    });
+    console.log('[DEBUG] Forms on results page: ' + JSON.stringify(formDump));
 
-    if (!detailUrl) {
-      // Fallback: use SOID alone — the site returns the latest booking for a given SOID
-      const fallbackSoid = (summaryRow.soid || '').replace(/\D/g, '').trim();
-      if (fallbackSoid) {
-        const fallback = BASE_URL + '/InmDetails.asp?soid=' + encodeURIComponent(fallbackSoid) + '&BOOKING_ID=';
-        console.log('[scrape] No booking form found — SOID fallback: ' + fallback);
-        await page.goto(fallback, { waitUntil: 'domcontentloaded', timeout: 60000 });
-      } else {
-        console.log('[scrape] Cannot resolve detail URL — returning summary only');
-        await browser.close();
-        return res.json({ success: true, found: true, data: buildBasicData(summaryRow, name || soid) });
+    // Extract the booking detail URL from the form data
+    let bookingId  = '';
+    let bookingSoid = (summaryRow.soid || '').trim();
+
+    for (const form of formDump) {
+      const action = (form.action || '').toLowerCase();
+      if (action.includes('inmdetails') || action.includes('inm_details')) {
+        for (const inp of form.inputs) {
+          const n = (inp.name || '').toUpperCase();
+          if (n === 'BOOKING_ID' && inp.value) bookingId   = inp.value;
+          if (n === 'SOID'       && inp.value) bookingSoid = inp.value;
+        }
+        if (bookingId) break;
       }
-    } else {
-      console.log('[scrape] Navigating to detail: ' + detailUrl);
-      await page.goto(detailUrl, { waitUntil: 'domcontentloaded', timeout: 120000 });
     }
+
+    // If not found in form actions, scan ALL inputs for BOOKING_ID
+    if (!bookingId) {
+      for (const form of formDump) {
+        for (const inp of form.inputs) {
+          if ((inp.name || '').toUpperCase() === 'BOOKING_ID' && inp.value) {
+            bookingId   = inp.value;
+            // Also grab soid from same form
+            const soidInp = form.inputs.find(i => (i.name || '').toUpperCase() === 'SOID');
+            if (soidInp && soidInp.value) bookingSoid = soidInp.value;
+            break;
+          }
+        }
+        if (bookingId) break;
+      }
+    }
+
+    console.log('[scrape] BOOKING_ID=' + bookingId + ' | SOID=' + bookingSoid);
+
+    if (!bookingId) {
+      console.log('[scrape] ERROR: No BOOKING_ID found — cannot navigate to detail page');
+      console.log('[scrape] Returning summary-only data for: ' + summaryRow.name);
+      await browser.close();
+      return res.json({ success: true, found: true, data: buildBasicData(summaryRow, name || soid) });
+    }
+
+    // Build the GET URL — InmDetails.asp accepts GET with soid + BOOKING_ID
+    const detailUrl = BASE_URL + '/InmDetails.asp?soid=' + encodeURIComponent(bookingSoid) + '&BOOKING_ID=' + encodeURIComponent(bookingId);
+    console.log('[scrape] Navigating to: ' + detailUrl);
+    await page.goto(detailUrl, { waitUntil: 'domcontentloaded', timeout: 120000 });
 
     const detailFinalUrl = page.url();
     console.log('[scrape] Detail loaded → ' + detailFinalUrl);
+
+    // Bail out if we still hit the error page
+    if (detailFinalUrl.includes('Error_Page') || detailFinalUrl.includes('error_page')) {
+      console.log('[scrape] ERROR: Landed on error page even with BOOKING_ID=' + bookingId);
+      await browser.close();
+      return res.json({ success: true, found: true, data: buildBasicData(summaryRow, name || soid) });
+    }
 
     // ── DEBUG: dump raw page HTML and innerText to diagnose blank fields ──
     const debugDump = await page.evaluate(() => {
