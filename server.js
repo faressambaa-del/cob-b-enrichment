@@ -106,41 +106,22 @@ app.post('/scrape', async (req, res) => {
     page.setDefaultTimeout(300000);
     page.setDefaultNavigationTimeout(300000);
 
-    // ── STEP 1: Load search page ──────────────────────────────
-    console.log(`[scrape] Loading ${BASE_URL} ...`);
-    await page.goto(BASE_URL, {
+    // ── STEP 1: Jump directly to results URL ─────────────────
+    // The homepage (BASE_URL /) times out from Railway because the
+    // old ASP server drops non-browser connections on the root path.
+    // Sub-page URLs work fine — this is exactly what the browser
+    // submits after you click Search on enter_name.shtm.
+    const searchParam = soid
+      ? `soid=${encodeURIComponent(soid)}&inmate_name=&serial=&qry=Inquiry`
+      : `soid=&inmate_name=${encodeURIComponent(searchName).replace(/%20/g, '+')}&serial=&qry=Inquiry`;
+    const resultsUrl = `${BASE_URL}/inquiry.asp?${searchParam}`;
+
+    console.log(`[scrape] GET ${resultsUrl}`);
+    await page.goto(resultsUrl, {
       waitUntil: 'domcontentloaded',
-      timeout: 300000
+      timeout: 120000
     });
-    console.log(`[scrape] Loaded → ${page.url()}`);
-
-    // ── STEP 2: Fill NAME field ───────────────────────────────
-    // Actual field on site: input with name="name" or name="NAME"
-    if (soid) {
-      await page.locator('input[name="soid"], input[name="SOID"]')
-        .first().fill(soid).catch(() => {});
-    }
-    if (searchName) {
-      await page.locator('input[name="name"], input[name="NAME"], input[name="inmate_name"]')
-        .first().fill(searchName);
-      console.log(`[scrape] Name field filled: "${searchName}"`);
-    }
-
-    // ── STEP 3: Set dropdown to Inquiry ──────────────────────
-    await page.locator('select').first()
-      .selectOption({ label: 'Inquiry' })
-      .catch(async () => {
-        await page.locator('select').first().selectOption('Inquiry').catch(() => {});
-      });
-    console.log(`[scrape] Dropdown → Inquiry`);
-
-    // ── STEP 4: Click Search ──────────────────────────────────
-    console.log(`[scrape] Clicking Search...`);
-    await Promise.all([
-      page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 120000 }),
-      page.locator('input[value="Search"]').first().click()
-    ]);
-    console.log(`[scrape] Results → ${page.url()}`);
+    console.log(`[scrape] Results loaded → ${page.url()}`);
 
     // ── STEP 5: Check for results ─────────────────────────────
     const bodyText = await page.textContent('body');
@@ -486,14 +467,10 @@ app.post('/admissions', async (req, res) => {
     page.setDefaultTimeout(120000);
     page.setDefaultNavigationTimeout(120000);
 
-    await page.goto(BASE_URL, { waitUntil: 'domcontentloaded', timeout: 120000 });
-    const admBtn = await page.$('input[value="Admissions"], a:has-text("Admissions")');
-    if (!admBtn) throw new Error('Admissions button not found');
-
-    await Promise.all([
-      page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 120000 }),
-      admBtn.click()
-    ]);
+    // Skip homepage — go directly to admissions results
+    const admUrl = `${BASE_URL}/inquiry.asp?soid=&inmate_name=&serial=&qry=Admissions`;
+    console.log('[admissions] GET ' + admUrl);
+    await page.goto(admUrl, { waitUntil: 'domcontentloaded', timeout: 120000 });
     await page.waitForSelector('table', { timeout: 30000 });
 
     const inmates = await page.evaluate(() => {
