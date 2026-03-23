@@ -43,4 +43,15 @@ export class ProxyRotator {
     if (!proxy) return undefined;
     
     const playwrightProxy: ProxyOptions = {
-      server:
+      server: proxy.server,
+    };
+    if (proxy.username) playwrightProxy.username = proxy.username;
+    if (proxy.password) playwrightProxy.password = proxy.password;
+    
+    return { proxy: playwrightProxy };
+  }
+
+  hasProxies(): boolean {
+    return this.proxies.length > 0;
+  }
+}
