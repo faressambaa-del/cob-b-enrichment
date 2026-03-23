@@ -103,8 +103,8 @@ app.post('/scrape', async (req, res) => {
     });
 
     // Set generous default timeouts
-    page.setDefaultTimeout(120000);
-    page.setDefaultNavigationTimeout(120000);
+    page.setDefaultTimeout(300000);
+    page.setDefaultNavigationTimeout(300000);
 
     // ── STEP 1: Load search page ──────────────────────────────
     console.log(`[scrape] Loading ${BASE_URL} ...`);
