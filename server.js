@@ -1,28 +1,37 @@
-const express = require('express');
+const express  = require('express');
 const { chromium } = require('playwright');
 
-const app = express();
+const app      = express();
 app.use(express.json());
 
 const PORT     = process.env.PORT || 3000;
 const BASE_URL = 'http://inmate-search.cobbsheriff.org';
+const FORM_URL = BASE_URL + '/enter_name.shtm';
 
+// ─────────────────────────────────────────────────────────────
+// HEALTH CHECK
+// ─────────────────────────────────────────────────────────────
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', service: 'cobb-county-scraper', port: PORT, timestamp: new Date().toISOString() });
 });
 
+// ─────────────────────────────────────────────────────────────
+// FORMAT NAME
+// "Garcia, Elvia Yadira" → "GARCIA ELVIA"
+// ─────────────────────────────────────────────────────────────
 function formatName(raw) {
   if (!raw) return '';
   raw = raw.trim();
   if (raw.includes(',')) {
     const parts = raw.split(',');
-    const last  = parts[0].trim();
-    const first = parts[1].trim().split(' ')[0];
-    return `${last} ${first}`.toUpperCase();
+    return (parts[0].trim() + ' ' + parts[1].trim().split(' ')[0]).toUpperCase();
   }
   return raw.toUpperCase();
 }
 
+// ─────────────────────────────────────────────────────────────
+// LAUNCH BROWSER
+// ─────────────────────────────────────────────────────────────
 async function launchBrowser() {
   return chromium.launch({
     headless: true,
@@ -34,11 +43,12 @@ async function launchBrowser() {
   });
 }
 
+// ─────────────────────────────────────────────────────────────
+// /scrape
+// ─────────────────────────────────────────────────────────────
 app.post('/scrape', async (req, res) => {
   const { name, soid } = req.body;
-  if (!name && !soid) {
-    return res.status(400).json({ success: false, error: 'Provide name or soid' });
-  }
+  if (!name && !soid) return res.status(400).json({ success: false, error: 'Provide name or soid' });
 
   const searchName = name ? formatName(name) : '';
   console.log(`[scrape] "${name || soid}" → "${searchName}"`);
@@ -46,59 +56,67 @@ app.post('/scrape', async (req, res) => {
   let browser;
   try {
     browser = await launchBrowser();
-    const page = await browser.newPage();
 
-    await page.setExtraHTTPHeaders({
-      'User-Agent':      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-      'Accept':          'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-      'Accept-Language': 'en-US,en;q=0.9',
-      'Referer':         BASE_URL + '/enter_name.shtm'
+    // Use a persistent browser context so cookies carry across pages
+    const context = await browser.newContext({
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+      extraHTTPHeaders: {
+        'Accept':          'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9'
+      }
     });
 
-    page.setDefaultTimeout(300000);
-    page.setDefaultNavigationTimeout(300000);
+    context.setDefaultTimeout(300000);
+    context.setDefaultNavigationTimeout(300000);
+    const page = await context.newPage();
 
-    // STEP 1: Jump directly to results — skips homepage which times out from Railway
-    const param      = soid
-      ? 'soid=' + encodeURIComponent(soid) + '&inmate_name=&serial=&qry=Inquiry'
-      : 'soid=&inmate_name=' + encodeURIComponent(searchName).replace(/%20/g, '+') + '&serial=&qry=Inquiry';
-    const resultsUrl = BASE_URL + '/inquiry.asp?' + param;
+    // ── STEP 1: Visit the form page to get ASP session cookie ─
+    // Without ASPSESSIONID cookie the results page strips all
+    // interactive elements (forms, booking buttons).
+    console.log(`[scrape] Step 1 — Getting session from: ${FORM_URL}`);
+    await page.goto(FORM_URL, { waitUntil: 'domcontentloaded', timeout: 300000 });
+    console.log(`[scrape] Form loaded → ${page.url()}`);
 
-    console.log('[scrape] GET ' + resultsUrl);
-    await page.goto(resultsUrl, { waitUntil: 'domcontentloaded', timeout: 300000 });
-    console.log('[scrape] Results → ' + page.url());
+    // Log cookies so we can confirm session was set
+    const cookies = await context.cookies();
+    console.log(`[scrape] Cookies after form load: ${JSON.stringify(cookies.map(c => c.name + '=' + c.value.substring(0,8)))}`);
 
-    // STEP 2: Check for results
+    // ── STEP 2: Fill and submit the search form ───────────────
+    // Fill NAME field
+    await page.waitForSelector('input[name="name"], input[name="NAME"]', { timeout: 30000 });
+    if (soid) {
+      await page.fill('input[name="soid"], input[name="SOID"]', soid).catch(() => {});
+    }
+    await page.fill('input[name="name"], input[name="NAME"]', soid ? '' : searchName);
+
+    // Set dropdown to Inquiry (shows released + in custody)
+    await page.selectOption('select', { label: 'Inquiry' }).catch(async () => {
+      await page.selectOption('select', 'Inquiry').catch(() => {});
+    });
+
+    console.log(`[scrape] Step 2 — Submitting form for: "${searchName || soid}"`);
+    await Promise.all([
+      page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 300000 }),
+      page.click('input[value="Search"]')
+    ]);
+    console.log(`[scrape] Results → ${page.url()}`);
+
+    // ── STEP 3: Check for results ─────────────────────────────
     const bodyText = await page.textContent('body');
     const hasTable = await page.$('table') !== null;
-
-    if (!hasTable ||
-        bodyText.toLowerCase().includes('no record') ||
-        bodyText.toLowerCase().includes('no match') ||
-        bodyText.toLowerCase().includes('0 record')) {
-      console.log('[scrape] No results for: ' + (searchName || soid));
+    if (!hasTable || bodyText.toLowerCase().includes('no record') || bodyText.toLowerCase().includes('no match')) {
+      console.log(`[scrape] No results for: ${searchName || soid}`);
       await browser.close();
       return res.json({ success: true, found: false, name: name || soid, data: null });
     }
 
-    // STEP 3: Parse summary row
+    // ── STEP 4: Parse summary row ─────────────────────────────
     const summaryRow = await page.evaluate(() => {
-      const rows = Array.from(document.querySelectorAll('table tr'));
-      for (const row of rows) {
+      for (const row of document.querySelectorAll('table tr')) {
         const cells = Array.from(row.querySelectorAll('td')).map(td => td.innerText.trim());
-        if (cells.length >= 7 &&
-            cells[1] && cells[1].length > 2 &&
-            !cells[1].toLowerCase().includes('name') &&
-            !cells[1].toLowerCase().includes('image')) {
-          return {
-            name:            cells[1] || '',
-            dob:             cells[2] || '',
-            race:            cells[3] || '',
-            sex:             cells[4] || '',
-            location:        cells[5] || '',
-            soid:            cells[6] || '',
-            days_in_custody: cells[7] || ''
-          };
+        if (cells.length >= 7 && cells[1] && cells[1].length > 2 &&
+            !cells[1].toLowerCase().includes('name') && !cells[1].toLowerCase().includes('image')) {
+          return { name: cells[1]||'', dob: cells[2]||'', race: cells[3]||'', sex: cells[4]||'', location: cells[5]||'', soid: cells[6]||'', days_in_custody: cells[7]||'' };
         }
       }
       return null;
@@ -109,50 +127,87 @@ app.post('/scrape', async (req, res) => {
       await browser.close();
       return res.json({ success: true, found: false, name: name || soid, data: null });
     }
-    console.log('[scrape] Found: "' + summaryRow.name + '" SOID:' + summaryRow.soid + ' Location:' + summaryRow.location);
+    console.log(`[scrape] Found: "${summaryRow.name}" SOID:${summaryRow.soid} Location:${summaryRow.location}`);
 
-    // STEP 4: Extract BOOKING_ID from the page
+    // ── STEP 5: Extract BOOKING_ID ────────────────────────────
+    // With a valid session the page should now have forms with BOOKING_ID
     const bookingInfo = await page.evaluate(() => {
-      // Try all forms first
+      // Strategy 1: form with InmDetails action
       for (const form of document.querySelectorAll('form')) {
         const action = (form.action || '').toLowerCase();
         if (!action.includes('inmdetails') && !action.includes('inm_details')) continue;
         const inputs = {};
-        form.querySelectorAll('input').forEach(i => { inputs[(i.name || '').toUpperCase()] = i.value; });
-        if (inputs['BOOKING_ID']) return { soid: inputs['SOID'] || '', bookingId: inputs['BOOKING_ID'] };
+        form.querySelectorAll('input').forEach(i => { inputs[(i.name||'').toUpperCase()] = i.value; });
+        if (inputs['BOOKING_ID']) return { soid: inputs['SOID']||'', bookingId: inputs['BOOKING_ID'] };
       }
-      // Scan ALL inputs on page
+      // Strategy 2: scan all inputs on page
       const all = {};
-      document.querySelectorAll('input').forEach(i => { all[(i.name || '').toUpperCase()] = i.value; });
-      if (all['BOOKING_ID']) return { soid: all['SOID'] || '', bookingId: all['BOOKING_ID'] };
-      // Any <a> linking to InmDetails
+      document.querySelectorAll('input').forEach(i => { all[(i.name||'').toUpperCase()] = i.value; });
+      if (all['BOOKING_ID']) return { soid: all['SOID']||'', bookingId: all['BOOKING_ID'] };
+      // Strategy 3: any <a> with InmDetails href
       for (const a of document.querySelectorAll('a')) {
-        if ((a.href || '').toLowerCase().includes('inmdetails')) return { href: a.href };
+        if ((a.href||'').toLowerCase().includes('inmdetails')) return { href: a.href };
       }
+      // Debug dump — log everything visible on the page
+      const forms = Array.from(document.querySelectorAll('form')).map(f => ({
+        action: f.action,
+        inputs: Array.from(f.querySelectorAll('input')).map(i => i.name + '=' + i.value)
+      }));
+      const links = Array.from(document.querySelectorAll('a')).map(a => a.href).filter(Boolean);
+      const allBtns = Array.from(document.querySelectorAll('input[type=submit]')).map(i => i.value);
+      console.log('BOOKING_DEBUG forms=' + JSON.stringify(forms));
+      console.log('BOOKING_DEBUG links=' + JSON.stringify(links));
+      console.log('BOOKING_DEBUG buttons=' + JSON.stringify(allBtns));
       return null;
     });
 
-    console.log('[scrape] bookingInfo: ' + JSON.stringify(bookingInfo));
+    console.log(`[scrape] bookingInfo: ${JSON.stringify(bookingInfo)}`);
 
     if (!bookingInfo || (!bookingInfo.bookingId && !bookingInfo.href)) {
-      console.log('[scrape] No BOOKING_ID — returning summary only');
-      await browser.close();
-      return res.json({ success: true, found: true, data: buildBasicData(summaryRow, name || soid) });
-    }
+      // Last resort: click the booking button directly and follow navigation
+      console.log('[scrape] bookingInfo null — attempting direct button click');
+      try {
+        const clicked = await Promise.race([
+          // Try clicking any submit button in the results table
+          (async () => {
+            const btn = page.locator('table input[type="submit"]').first();
+            if (await btn.count() > 0) {
+              await Promise.all([
+                page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 60000 }),
+                btn.click()
+              ]);
+              return page.url();
+            }
+            return null;
+          })(),
+          new Promise(resolve => setTimeout(() => resolve(null), 65000))
+        ]);
 
-    // STEP 5: Navigate to detail page
-    let detailUrl;
-    if (bookingInfo.href) {
-      detailUrl = bookingInfo.href;
+        if (clicked && !clicked.includes('Error_Page') && clicked.includes('InmDetails')) {
+          console.log('[scrape] Click navigation → ' + clicked);
+          // Continue to parse detail page (fall through)
+        } else {
+          console.log('[scrape] Click did not reach InmDetails — returning summary only. URL: ' + clicked);
+          await browser.close();
+          return res.json({ success: true, found: true, data: buildBasicData(summaryRow, name || soid) });
+        }
+      } catch (clickErr) {
+        console.log('[scrape] Click failed: ' + clickErr.message + ' — returning summary only');
+        await browser.close();
+        return res.json({ success: true, found: true, data: buildBasicData(summaryRow, name || soid) });
+      }
     } else {
-      const ds = (bookingInfo.soid || summaryRow.soid || '').trim();
-      detailUrl = BASE_URL + '/InmDetails.asp?soid=' + encodeURIComponent(ds) + '&BOOKING_ID=' + encodeURIComponent(bookingInfo.bookingId);
+      // Navigate to detail page using extracted URL
+      const detailUrl = bookingInfo.href
+        ? bookingInfo.href
+        : BASE_URL + '/InmDetails.asp?soid=' + encodeURIComponent((bookingInfo.soid || summaryRow.soid).trim()) + '&BOOKING_ID=' + encodeURIComponent(bookingInfo.bookingId);
+
+      console.log(`[scrape] Navigating to detail: ${detailUrl}`);
+      await page.goto(detailUrl, { waitUntil: 'domcontentloaded', timeout: 300000 });
     }
 
-    console.log('[scrape] Detail: ' + detailUrl);
-    await page.goto(detailUrl, { waitUntil: 'domcontentloaded', timeout: 300000 });
     const finalUrl = page.url();
-    console.log('[scrape] Detail loaded → ' + finalUrl);
+    console.log(`[scrape] Detail loaded → ${finalUrl}`);
 
     if (finalUrl.includes('Error_Page') || finalUrl.includes('error_page')) {
       console.log('[scrape] Error page — returning summary only');
@@ -160,17 +215,16 @@ app.post('/scrape', async (req, res) => {
       return res.json({ success: true, found: true, data: buildBasicData(summaryRow, name || soid) });
     }
 
-    // STEP 6: Parse detail page
-    // Uses cell-by-cell DOM navigation — immune to nested table index issues.
+    // ── STEP 6: Parse detail page ─────────────────────────────
+    // Cell-by-cell DOM navigation — immune to nested table issues
     const detail = await page.evaluate(() => {
       const bodyText = document.body.innerText || '';
 
-      // Find <td/th> matching label exactly (case-insensitive),
-      // return text of next sibling <td> in same row, or first <td> of next row.
       function val(label) {
         const all = Array.from(document.querySelectorAll('td, th'));
         for (let i = 0; i < all.length; i++) {
           if ((all[i].innerText || '').trim().toLowerCase() !== label.toLowerCase()) continue;
+          // next sibling td in same row
           let sib = all[i].nextElementSibling;
           while (sib) {
             if (sib.tagName === 'TD' || sib.tagName === 'TH') {
@@ -179,6 +233,7 @@ app.post('/scrape', async (req, res) => {
             }
             sib = sib.nextElementSibling;
           }
+          // first td of next row
           const tr = all[i].closest('tr');
           if (tr && tr.nextElementSibling) {
             const td = tr.nextElementSibling.querySelector('td, th');
@@ -188,7 +243,6 @@ app.post('/scrape', async (req, res) => {
         return '';
       }
 
-      // Find <td/th> matching label, return ALL cells of NEXT <tr> as array.
       function rowAfter(label) {
         const all = Array.from(document.querySelectorAll('td, th'));
         for (let i = 0; i < all.length; i++) {
@@ -248,19 +302,16 @@ app.post('/scrape', async (req, res) => {
       const caseNum = val('case');
       const otn     = val('otn');
 
-      // Charges — rows between "Offense Date/Code Section" header and "Bond Amount"
+      // Charges
       const charges  = [];
       let inCharges  = false;
       const skipList = ['offense date','description','type','warrant','case','disposition','counts','bond','n/a',''];
       for (const tr of document.querySelectorAll('tr')) {
-        const cells   = Array.from(tr.querySelectorAll('td, th')).map(c => (c.innerText || '').trim());
+        const cells   = Array.from(tr.querySelectorAll('td, th')).map(c => (c.innerText||'').trim());
         const rowText = cells.join('|').toLowerCase();
-        if (!inCharges && rowText.includes('offense date') && rowText.includes('code section')) {
-          inCharges = true; continue;
-        }
+        if (!inCharges && rowText.includes('offense date') && rowText.includes('code section')) { inCharges = true; continue; }
         if (inCharges) {
-          if (rowText.includes('bond amount') || rowText.includes('release information') ||
-              rowText.includes('release date') || rowText.includes('attorney')) break;
+          if (rowText.includes('bond amount') || rowText.includes('release information') || rowText.includes('release date') || rowText.includes('attorney')) break;
           const desc = cells[2] || '';
           if (desc && desc.length > 2 && !skipList.includes(desc.toLowerCase())) {
             charges.push({ offense_date: cells[0]||'', code_section: cells[1]||'', description: desc, type: cells[3]||'', counts: cells[4]||'', bond: cells[5]||'' });
@@ -280,17 +331,13 @@ app.post('/scrape', async (req, res) => {
       const bsRow       = rowAfter('bond status');
       const bondStatus  = bsRow[1] || val('bond status');
       const bondingCo   = bsRow[2] || '';
-
-      // Bondsman
-      const bmanRow      = rowAfter('case/warrant');
-      const caseWarrant  = bmanRow[0] || '';
+      const bmanRow     = rowAfter('case/warrant');
+      const caseWarrant = bmanRow[0] || '';
       const bondsmanName = bmanRow[1] || '';
 
-      // Attorney
-      const noAttorney = bodyText.includes('No Attorney of Record');
-      const attorney   = noAttorney ? '' : val('attorney');
-
-      // Release Information
+      // Attorney & Release
+      const noAttorney     = bodyText.includes('No Attorney of Record');
+      const attorney       = noAttorney ? '' : val('attorney');
       const relRow         = rowAfter('release date');
       const releaseDate    = relRow[0] || '';
       const releaseOfficer = relRow[1] || '';
@@ -367,28 +414,30 @@ app.post('/scrape', async (req, res) => {
       charges_detail:      detail.charges || []
     };
 
-    console.log('[scrape] ✅ ' + data.full_name + ' | id:' + data.event_id + ' | booking:' + data.booking_date + ' | charges:' + data.charges.substring(0,60));
-
+    console.log(`[scrape] ✅ ${data.full_name} | id:${data.event_id} | booking:${data.booking_date} | addr:${data.address} | charges:${data.charges.substring(0,60)}`);
     return res.json({ success: true, found: true, search_name: name || soid || '', detail_url: finalUrl, scraped_at: new Date().toISOString(), data });
 
   } catch (err) {
     if (browser) await browser.close().catch(() => {});
-    console.error('[scrape] ❌ "' + (name || soid) + '": ' + err.message);
+    console.error(`[scrape] ❌ "${name || soid}": ${err.message}`);
     return res.status(500).json({ success: false, found: false, error: err.message, name: name || soid || '' });
   }
 });
 
+// ─────────────────────────────────────────────────────────────
+// /admissions
+// ─────────────────────────────────────────────────────────────
 app.post('/admissions', async (req, res) => {
   let browser;
   try {
     browser = await launchBrowser();
-    const page = await browser.newPage();
-    await page.setExtraHTTPHeaders({ 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' });
-    page.setDefaultTimeout(300000);
-    page.setDefaultNavigationTimeout(300000);
+    const context = await browser.newContext({ userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' });
+    context.setDefaultTimeout(300000);
+    context.setDefaultNavigationTimeout(300000);
+    const page = await context.newPage();
 
     const admUrl = BASE_URL + '/inquiry.asp?soid=&inmate_name=&serial=&qry=Admissions';
-    console.log('[admissions] GET ' + admUrl);
+    console.log(`[admissions] GET ${admUrl}`);
     await page.goto(admUrl, { waitUntil: 'domcontentloaded', timeout: 300000 });
     await page.waitForSelector('table', { timeout: 300000 });
 
@@ -401,35 +450,37 @@ app.post('/admissions', async (req, res) => {
     );
 
     await browser.close();
-    console.log('[admissions] ✅ ' + inmates.length + ' inmates');
+    console.log(`[admissions] ✅ ${inmates.length} inmates`);
     res.json({ success: true, count: inmates.length, inmates });
-
   } catch (err) {
     if (browser) await browser.close().catch(() => {});
-    console.error('[admissions] ❌ ' + err.message);
+    console.error(`[admissions] ❌ ${err.message}`);
     res.status(500).json({ success: false, error: err.message });
   }
 });
 
+// ─────────────────────────────────────────────────────────────
+// HELPER
+// ─────────────────────────────────────────────────────────────
 function buildBasicData(summaryRow, originalName) {
   const rawSoid = (summaryRow.soid || '').trim();
   const eventId = rawSoid ? String(parseInt(rawSoid.replace(/\D/g, ''), 10)) : '';
   const raceMap = { B:'Black', W:'White', H:'Hispanic', A:'Asian', O:'Other', I:'Indigenous', U:'Unknown' };
-  const race    = raceMap[(summaryRow.race || '').trim()] || summaryRow.race || '';
-  const sexRaw  = (summaryRow.sex || '').trim();
+  const race    = raceMap[(summaryRow.race||'').trim()] || summaryRow.race || '';
+  const sexRaw  = (summaryRow.sex||'').trim();
   const sex     = sexRaw === 'M' ? 'Male' : sexRaw === 'F' ? 'Female' : sexRaw;
   return {
-    event_id: eventId, full_name: summaryRow.name || '', original_name: originalName || '',
+    event_id: eventId, full_name: summaryRow.name||'', original_name: originalName||'',
     charges: '', charge_type: '', county: 'Cobb',
-    custody_status: summaryRow.location || '',
-    is_released: (summaryRow.location || '').toUpperCase() === 'RELEASED',
+    custody_status: summaryRow.location||'',
+    is_released: (summaryRow.location||'').toUpperCase() === 'RELEASED',
     bonding_amount: '', bonding_company: '', booking_date: '',
-    date_of_birth: summaryRow.dob || '', days_in_custody: summaryRow.days_in_custody || '',
+    date_of_birth: summaryRow.dob||'', days_in_custody: summaryRow.days_in_custody||'',
     race, sex, processed: false, locked: false, scraped_at: new Date().toISOString()
   };
 }
 
 app.listen(PORT, '0.0.0.0', () => {
-  console.log('Cobb County Scraper running on port ' + PORT);
-  console.log('BASE_URL: ' + BASE_URL);
+  console.log(`Cobb County Scraper running on port ${PORT}`);
+  console.log(`BASE_URL: ${BASE_URL}`);
 });
