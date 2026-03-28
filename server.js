@@ -1,145 +1,54 @@
-/**
- * Cobb County Sheriff Inmate Scraper
- *
- * PAGE FLOW (matches screenshots exactly):
- *  1. GET  /enter_name.shtm          → get ASP session cookie
- *  2. POST /inquiry.asp              → search by name, qry=Inquiry (dropdown)
- *     body: soid=&name=LASTNAME+FIRSTNAME&serial=&B1=Search&qry=Inquiry
- *  3. Parse results table            → extract SOID + BOOKING_ID from
- *                                       "Last Known Booking" button form
- *  4. GET  /InmDetails.asp?soid=...&BOOKING_ID=...  → full booking detail page
- *  5. Parse detail page              → all fields from Arrest/Booking Report
- */
+'use strict';
 
 const express      = require('express');
 const { chromium } = require('playwright');
-const http         = require('http');
 
-const app = express();
+const app  = express();
 app.use(express.json());
 
-const PORT     = process.env.PORT || 3000;
-const BASE_URL = 'http://inmate-search.cobbsheriff.org';
-const FORM_URL = BASE_URL + '/enter_name.shtm';
+const PORT = process.env.PORT || 3000;
 
-// ── Proxy config (set these in Railway → Variables) ───────────
 const PROXY_HOST = process.env.PROXY_HOST || '31.59.20.176';
-const PROXY_PORT = parseInt(process.env.PROXY_PORT || '6754', 10);
+const PROXY_PORT = process.env.PROXY_PORT || '6754';
 const PROXY_USER = process.env.PROXY_USER || 'bhkcvqwz';
 const PROXY_PASS = process.env.PROXY_PASS || '8o7dd3heu5b3';
+const PROXY_URL  = PROXY_HOST
+  ? `http://${PROXY_USER}:${PROXY_PASS}@${PROXY_HOST}:${PROXY_PORT}`
+  : null;
 
-function proxyRequest({ method = 'GET', targetUrl, postBody = null, cookies = [], extraHeaders = {} }) {
-  return new Promise((resolve, reject) => {
-    const auth      = Buffer.from(`${PROXY_USER}:${PROXY_PASS}`).toString('base64');
-    const cookieStr = cookies.map(c => c.split(';')[0]).join('; ');
-
-    const headers = {
-      'Host':                new URL(targetUrl).host,
-      'User-Agent':          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-      'Accept':              'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-      'Accept-Language':     'en-US,en;q=0.9',
-      'Proxy-Authorization': `Basic ${auth}`,
-      'Connection':          'close',
-      ...extraHeaders,
-    };
-    if (cookieStr)  headers['Cookie']          = cookieStr;
-    if (postBody) {
-      headers['Content-Type']   = 'application/x-www-form-urlencoded';
-      headers['Content-Length'] = Buffer.byteLength(postBody);
-    }
-
-    const req = http.request(
-      { host: PROXY_HOST, port: PROXY_PORT, method, path: targetUrl, headers },
-      (resp) => {
-        let body = '';
-        resp.on('data', c => { body += c; });
-        resp.on('end', () => resolve({
-          status:   resp.statusCode,
-          headers:  resp.headers,
-          cookies:  resp.headers['set-cookie'] || [],
-          location: resp.headers['location'] || null,
-          body,
-        }));
-      }
-    );
-    req.setTimeout(30000, () => req.destroy(new Error('Request timed out after 30s')));
-    req.on('error', reject);
-    if (postBody) req.write(postBody);
-    req.end();
-  });
-}
-
-async function withRetry(fn, attempts = 3, delayMs = 3000) {
-  let lastErr;
-  for (let i = 0; i < attempts; i++) {
-    try { return await fn(); } catch (err) {
-      lastErr = err;
-      console.log(`[retry] ${i + 1}/${attempts}: ${err.message}`);
-      if (i < attempts - 1) await sleep(delayMs * (i + 1));
-    }
-  }
-  throw lastErr;
-}
-const sleep = ms => new Promise(r => setTimeout(r, ms));
-
-async function getSessionCookie() {
-  console.log(`[session] GET ${FORM_URL}`);
-  const r = await proxyRequest({ targetUrl: FORM_URL });
-  console.log(`[session] ${r.status} | body:${r.body.length} | cookies:${JSON.stringify(r.cookies)}`);
-  if (r.status === 407)  throw new Error('Proxy auth failed (407) — update PROXY_USER/PROXY_PASS');
-  if (r.body.toLowerCase().includes('bad gateway')) throw new Error('Proxy bad gateway — update PROXY_HOST/PROXY_PORT');
-  if (r.status !== 200)  throw new Error(`Session GET returned ${r.status}`);
-  return { cookies: r.cookies, body: r.body };
-}
-
-async function submitSearch(sessionCookies, searchName, soidVal) {
-  let postBody;
-  if (soidVal) {
-    postBody = `soid=${encodeURIComponent(soidVal)}&name=&serial=&B1=Search&qry=Inquiry`;
-  } else {
-    postBody = `soid=&name=${encodeURIComponent(searchName).replace(/%20/g, '+')}&serial=&B1=Search&qry=Inquiry`;
-  }
-
-  console.log(`[search] POST /inquiry.asp  body=${postBody}`);
-  const r = await proxyRequest({
-    method:    'POST',
-    targetUrl: BASE_URL + '/inquiry.asp',
-    postBody,
-    cookies:   sessionCookies,
-    extraHeaders: {
-      'Referer': FORM_URL,
-      'Origin':  BASE_URL,
-      'Cache-Control': 'no-cache',
-    },
-  });
-  console.log(`[search] ${r.status} | body:${r.body.length} | loc:${r.location || 'none'}`);
-  return { ...r, cookies: [...sessionCookies, ...r.cookies] };
-}
-
-async function getPage(url, cookies, referer) {
-  const r = await proxyRequest({
-    targetUrl:    url,
-    cookies,
-    extraHeaders: referer ? { 'Referer': referer } : {},
-  });
-  console.log(`[get] ${url} → ${r.status} | ${r.body.length} chars`);
-  return { ...r, cookies: [...cookies, ...r.cookies] };
-}
-
-async function parseHtml(browser, html) {
-  const ctx  = await browser.newContext();
-  const page = await ctx.newPage();
-  await page.setContent(html, { waitUntil: 'domcontentloaded' });
-  return { page, ctx };
-}
+const BASE_URL = 'http://inmate-search.cobbsheriff.org';
 
 async function launchBrowser() {
-  return chromium.launch({
+  const opts = {
     headless: true,
-    args: ['--no-sandbox','--disable-setuid-sandbox','--disable-dev-shm-usage',
-           '--disable-gpu','--no-first-run','--no-zygote','--single-process'],
-  });
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-gpu',
+      '--no-first-run',
+      '--no-zygote',
+      '--single-process',
+    ],
+  };
+  if (PROXY_URL) {
+    opts.proxy = { server: `http://${PROXY_HOST}:${PROXY_PORT}` };
+  }
+  return chromium.launch(opts);
 }
+
+async function newContext(browser) {
+  const ctxOpts = {
+    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+    extraHTTPHeaders: { 'Accept-Language': 'en-US,en;q=0.9' },
+  };
+  if (PROXY_URL && PROXY_USER) {
+    ctxOpts.httpCredentials = { username: PROXY_USER, password: PROXY_PASS };
+  }
+  return browser.newContext(ctxOpts);
+}
+
+const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 function formatName(raw) {
   if (!raw) return '';
@@ -152,463 +61,331 @@ function formatName(raw) {
   return raw;
 }
 
-async function parseResultsPage(page) {
-  return page.evaluate(() => {
-    const results = [];
-    const rows = Array.from(document.querySelectorAll('table tr'));
+async function scrapeInmate(searchName, soidVal) {
+  const inquiryUrl = [
+    BASE_URL + '/inquiry.asp',
+    `?soid=${encodeURIComponent(soidVal || '')}`,
+    `&inmate_name=${encodeURIComponent(searchName || '')}`,
+    `&serial=`,
+    `&qry=Inquiry`,
+  ].join('');
 
-    for (const row of rows) {
-      const cells = Array.from(row.querySelectorAll('td'));
-      if (cells.length < 6) continue;
+  console.log(`[scrape] Navigating to: ${inquiryUrl}`);
 
-      const nameCell = (cells[1]?.innerText || '').trim();
-      if (!nameCell || nameCell.length < 2) continue;
-      if (nameCell.toLowerCase() === 'name') continue;
-      if (nameCell.toLowerCase().includes('image')) continue;
+  const browser = await launchBrowser();
+  const context = await newContext(browser);
+  const page    = await context.newPage();
 
-      let bookingId = '';
-      let soidFromForm = '';
-      let detailUrl = '';
+  try {
+    await page.goto(inquiryUrl, { waitUntil: 'networkidle', timeout: 90000 });
+    await sleep(3000);
 
-      for (const form of row.querySelectorAll('form')) {
-        const inputs = {};
-        form.querySelectorAll('input').forEach(inp => {
-          inputs[(inp.name || '').toUpperCase()] = inp.value || '';
-        });
-        if (inputs['BOOKING_ID']) {
-          bookingId    = inputs['BOOKING_ID'];
-          soidFromForm = inputs['SOID'] || '';
-        }
-      }
+    const pageText = await page.textContent('body').catch(() => '');
 
-      for (const a of row.querySelectorAll('a')) {
-        const href = a.href || a.getAttribute('href') || '';
-        if (href.toLowerCase().includes('inmdetails')) {
-          detailUrl = href;
-          if (!bookingId) {
-            try {
-              const u = new URL(href, 'http://inmate-search.cobbsheriff.org');
-              bookingId    = u.searchParams.get('BOOKING_ID') || '';
-              soidFromForm = u.searchParams.get('soid') || soidFromForm;
-            } catch (e) {}
-          }
-        }
-      }
-
-      const soid = (cells[6]?.innerText || '').trim();
-
-      results.push({
-        name:            nameCell,
-        dob:             (cells[2]?.innerText || '').trim(),
-        race:            (cells[3]?.innerText || '').trim(),
-        sex:             (cells[4]?.innerText || '').trim(),
-        location:        (cells[5]?.innerText || '').trim(),
-        soid,
-        days_in_custody: (cells[7]?.innerText || '').trim(),
-        booking_id:      bookingId,
-        soid_from_form:  soidFromForm || soid,
-        detail_url:      detailUrl,
-      });
+    if (/no record/i.test(pageText) || /not found/i.test(pageText) || /no match/i.test(pageText)) {
+      console.log('[scrape] No record found');
+      return { found: false, data: null };
     }
 
-    return results;
-  });
-}
-
-async function parseDetailPage(page) {
-  return page.evaluate(() => {
-    const bodyText = (document.body?.innerText || '').toLowerCase();
-
-    function cellAfter(label) {
-      const all = Array.from(document.querySelectorAll('td, th'));
-      for (let i = 0; i < all.length; i++) {
-        const t = (all[i].innerText || '').trim().toLowerCase();
-        if (t !== label.toLowerCase()) continue;
-        let sib = all[i].nextElementSibling;
-        while (sib) {
-          if (sib.tagName === 'TD' || sib.tagName === 'TH') {
-            const v = (sib.innerText || '').trim();
-            if (v && v.toLowerCase() !== label.toLowerCase()) return v;
-          }
-          sib = sib.nextElementSibling;
-        }
-        const tr = all[i].closest('tr');
-        if (tr?.nextElementSibling) {
-          const td = tr.nextElementSibling.querySelector('td');
-          if (td) return (td.innerText || '').trim();
-        }
-      }
-      return '';
-    }
-
-    function rowAfter(label) {
-      const all = Array.from(document.querySelectorAll('td, th'));
-      for (let i = 0; i < all.length; i++) {
-        const t = (all[i].innerText || '').trim().toLowerCase();
-        if (t !== label.toLowerCase()) continue;
-        const tr = all[i].closest('tr');
-        if (tr?.nextElementSibling) {
-          return Array.from(tr.nextElementSibling.querySelectorAll('td, th'))
-            .map(c => (c.innerText || '').trim());
-        }
-      }
-      return [];
-    }
-
-    const bookingRow  = rowAfter('agency id');
-    const personalRow = rowAfter('name');
-    const physicalRow = rowAfter('height');
-    const addressRow  = rowAfter('address');
-    const arrestRow   = rowAfter('arrest agency');
-
-    const charges = [];
-    const allRows = Array.from(document.querySelectorAll('tr'));
-    let inChargeSection = false;
-    let inChargeData    = false;
-    let currentCharge   = null;
-
-    const skipLabels = new Set([
-      'offense date','code section','description','type','counts','bond',
-      'warrant','case','otn','disposition','bond amount','bond status',
-      'charges','n/a','',
-    ]);
-
-    for (let ri = 0; ri < allRows.length; ri++) {
-      const row   = allRows[ri];
-      const cells = Array.from(row.querySelectorAll('td, th')).map(c => (c.innerText || '').trim());
-      const text  = cells.join('|').toLowerCase();
-
-      if (!inChargeSection && text.includes('charges') && !text.includes('bond')) {
-        inChargeSection = true;
-        continue;
-      }
-      if (!inChargeSection) continue;
-      if (text.includes('release information') || text.includes('attorney')) break;
-
-      if (text.includes('warrant') && !text.includes('case') && cells[0]?.toLowerCase() === 'warrant') {
-        if (currentCharge) charges.push(currentCharge);
-        currentCharge = {
-          warrant: cells[1] || '', warrant_date: cells[3] || '', warrant_count: cells[4] || '',
-          case_number: '', otn: '', offense_date: '', code_section: '',
-          description: '', type: '', counts: '', bond: '', disposition: '', bond_amount: '', bond_status: '',
+    // Intercept window.open to capture detail URL
+    let capturedUrl = await page.evaluate(() => {
+      return new Promise((resolve) => {
+        window.open = (url) => {
+          resolve(url);
+          return null;
         };
-        inChargeData = false;
-        continue;
-      }
 
-      if (cells[0]?.toLowerCase() === 'case' && currentCharge) {
-        currentCharge.case_number = cells[1] || '';
-        currentCharge.otn         = cells[3] || '';
-        continue;
-      }
+        const buttons = Array.from(document.querySelectorAll('input[type="submit"], button, input[type="button"]'));
+        const bookingBtn = buttons.find(b =>
+          /last/i.test(b.value || b.innerText || '') ||
+          /booking/i.test(b.value || b.innerText || '')
+        );
 
-      if (text.includes('offense date') && text.includes('code section')) {
-        inChargeData = true;
-        continue;
-      }
-
-      if (inChargeData && currentCharge && cells.length >= 3) {
-        const desc = cells[2] || '';
-        if (desc && !skipLabels.has(desc.toLowerCase()) && desc.toLowerCase() !== 'n/a') {
-          currentCharge.offense_date = cells[0] || currentCharge.offense_date;
-          currentCharge.code_section = cells[1] || currentCharge.code_section;
-          currentCharge.description  = desc;
-          currentCharge.type         = cells[3] || '';
-          currentCharge.counts       = cells[4] || '';
-          currentCharge.bond         = cells[5] || '';
-          inChargeData = false;
+        if (bookingBtn) {
+          bookingBtn.click();
+        } else {
+          resolve(null);
         }
-        continue;
-      }
 
-      if (cells[0]?.toLowerCase() === 'disposition' && currentCharge) {
-        currentCharge.disposition = cells[1] || '';
-        continue;
-      }
+        setTimeout(() => resolve(null), 4000);
+      });
+    });
 
-      if (text.includes('bond amount') && currentCharge) {
-        const amount = cells.filter(c => c && c !== 'Bond Amount').pop() || '';
-        currentCharge.bond_amount = amount;
-        continue;
-      }
+    console.log(`[scrape] Captured URL: ${capturedUrl}`);
 
-      if (text.includes('bond status') && currentCharge) {
-        const idx = cells.findIndex(c => c.toLowerCase() === 'bond status');
-        currentCharge.bond_status = cells[idx + 1] || '';
-        continue;
+    // Fallback: extract from raw HTML
+    if (!capturedUrl) {
+      const html = await page.content();
+      const match = html.match(/InmDetails\.asp\?[^"'<>\s]+/);
+      if (match) {
+        capturedUrl = match[0].replace(/&amp;/g, '&');
+        console.log(`[scrape] Extracted from HTML: ${capturedUrl}`);
       }
     }
-    if (currentCharge) charges.push(currentCharge);
 
-    const releaseRow = rowAfter('release date');
-
-    let height = physicalRow[0] || '';
-    if (/^\d{3,4}$/.test(height)) {
-      const h = height.padStart(3, '0');
-      height  = `${h[0]}'${h.slice(1)}"`;
+    // Navigate to detail page
+    if (capturedUrl) {
+      const fullUrl = capturedUrl.startsWith('http')
+        ? capturedUrl
+        : BASE_URL + '/' + capturedUrl.replace(/^\//, '');
+      console.log(`[scrape] Going to detail: ${fullUrl}`);
+      await page.goto(fullUrl, { waitUntil: 'networkidle', timeout: 90000 });
+      await sleep(3000);
+    } else {
+      console.log('[scrape] No detail URL — parsing current page');
     }
 
-    const raceSex = (personalRow[2] || '').replace(/\s/g, '');
-    const [raceCode, sexCode] = raceSex.split('/');
+    console.log(`[scrape] Final URL: ${page.url()}`);
+
+    const allRows = await page.evaluate(() => {
+      const rows = [];
+      document.querySelectorAll('table').forEach(tbl => {
+        tbl.querySelectorAll('tr').forEach(tr => {
+          const cells = Array.from(tr.querySelectorAll('td, th'))
+            .map(td => (td.innerText || '').trim());
+          if (cells.some(c => c.length > 0)) rows.push(cells);
+        });
+      });
+      return rows;
+    });
+
+    const fullText = await page.evaluate(() => document.body.innerText || '');
+    console.log(`[scrape] ✅ Scraped ${allRows.length} rows`);
+
+    const data = parseRows(allRows, fullText, searchName || soidVal);
 
     return {
-      agency_id:          bookingRow[0] || '',
-      arrest_date_time:   bookingRow[1] || '',
-      booking_started:    bookingRow[2] || '',
-      booking_complete:   bookingRow[3] || '',
-      full_name:          personalRow[0] || '',
-      dob:                personalRow[1] || '',
-      race_code:          raceCode || '',
-      sex_code:           sexCode  || '',
-      location:           personalRow[3] || '',
-      soid:               personalRow[4] || '',
-      days_in_custody:    personalRow[5] || '',
-      height,
-      weight:             physicalRow[1] || '',
-      hair:               physicalRow[2] || '',
-      eyes:               physicalRow[3] || '',
-      address:            addressRow[0] || '',
-      city:               addressRow[1] || '',
-      state:              addressRow[2] || '',
-      zip:                addressRow[3] || '',
-      place_of_birth:     cellAfter('place of birth'),
-      arresting_agency:   arrestRow[0] || '',
-      arrest_officer:     arrestRow[1] || '',
-      location_of_arrest: arrestRow[2] || '',
-      serial_number:      arrestRow[3] || '',
-      charges,
-      release_date:       releaseRow[0] || '',
-      release_officer:    releaseRow[1] || '',
-      released_to:        releaseRow[2] || '',
-      is_released:        !bodyText.includes('not released'),
-      attorney:           bodyText.includes('no attorney of record') ? '' : cellAfter('attorney'),
+      found:      true,
+      detail_url: page.url(),
+      scraped_at: new Date().toISOString(),
+      data,
     };
-  });
+
+  } finally {
+    await context.close().catch(() => {});
+    await browser.close().catch(() => {});
+  }
 }
 
-const RACE_MAP = { B:'Black', W:'White', H:'Hispanic', A:'Asian', O:'Other', I:'Indigenous', U:'Unknown' };
+function parseRows(allRows, fullText, originalName) {
+  const txt = (fullText || '').toLowerCase();
 
-function buildRecord(detail, summaryRow, originalName) {
-  const race = RACE_MAP[detail.race_code] || detail.race_code || RACE_MAP[summaryRow.race] || summaryRow.race || '';
-  const sex  = detail.sex_code === 'M' ? 'Male' : detail.sex_code === 'F' ? 'Female' : detail.sex_code || summaryRow.sex || '';
+  function findVal(label) {
+    const l = label.toLowerCase();
+    for (let i = 0; i < allRows.length; i++) {
+      for (let j = 0; j < allRows[i].length; j++) {
+        if ((allRows[i][j] || '').toLowerCase().trim() === l) {
+          if (allRows[i][j + 1]) return allRows[i][j + 1];
+          if (allRows[i + 1] && allRows[i + 1][0]) return allRows[i + 1][0];
+        }
+      }
+    }
+    return '';
+  }
 
-  const chargesDesc = detail.charges.map(c => c.description).filter(Boolean).join('; ');
-  const chargeType  = [...new Set(detail.charges.map(c => {
+  const agencyIdx   = allRows.findIndex(r => r.some(c => /agency id/i.test(c)));
+  const bookingRow  = agencyIdx >= 0 ? (allRows[agencyIdx + 1] || []) : [];
+
+  const nameIdx     = allRows.findIndex(r => r.some(c => /^name$/i.test(c.trim())));
+  const personalRow = nameIdx >= 0 ? (allRows[nameIdx + 1] || []) : [];
+
+  const heightIdx   = allRows.findIndex(r => r.some(c => /^height$/i.test(c.trim())));
+  const physicalRow = heightIdx >= 0 ? (allRows[heightIdx + 1] || []) : [];
+
+  const addrIdx    = allRows.findIndex(r => r.some(c => /^address$/i.test(c.trim())));
+  const addressRow = addrIdx >= 0 ? (allRows[addrIdx + 1] || []) : [];
+
+  const arrestIdx  = allRows.findIndex(r => r.some(c => /arrest agency/i.test(c)));
+  const arrestRow  = arrestIdx >= 0 ? (allRows[arrestIdx + 1] || []) : [];
+
+  const charges = [];
+  let inCharges = false;
+  let currentCharge = null;
+
+  for (let i = 0; i < allRows.length; i++) {
+    const row  = allRows[i];
+    const text = row.join('|').toLowerCase();
+
+    if (!inCharges && text.includes('charges') && !text.includes('bond')) {
+      inCharges = true;
+      continue;
+    }
+    if (!inCharges) continue;
+    if (/release information|attorney/i.test(text)) break;
+
+    if (/^warrant$/i.test((row[0] || '').trim())) {
+      if (currentCharge) charges.push(currentCharge);
+      currentCharge = {
+        warrant: row[1] || '', warrant_date: row[3] || '',
+        case_number: '', otn: '', offense_date: '', code_section: '',
+        description: '', type: '', counts: '', bond: '',
+        disposition: '', bond_amount: '', bond_status: '',
+      };
+      continue;
+    }
+    if (/^case$/i.test((row[0] || '').trim()) && currentCharge) {
+      currentCharge.case_number = row[1] || '';
+      currentCharge.otn         = row[3] || '';
+      continue;
+    }
+    if (text.includes('offense date') && text.includes('code section')) continue;
+    if (/^disposition$/i.test((row[0] || '').trim()) && currentCharge) {
+      currentCharge.disposition = row[1] || '';
+      continue;
+    }
+    if (text.includes('bond amount') && currentCharge) {
+      currentCharge.bond_amount = row.filter(c => c && !/bond amount/i.test(c)).pop() || '';
+      continue;
+    }
+    if (text.includes('bond status') && currentCharge) {
+      const idx = row.findIndex(c => /bond status/i.test(c));
+      currentCharge.bond_status = row[idx + 1] || '';
+      continue;
+    }
+    if (currentCharge && row[2] && row[2].length > 2 &&
+        !['description','type','n/a',''].includes(row[2].toLowerCase())) {
+      currentCharge.offense_date = row[0] || '';
+      currentCharge.code_section = row[1] || '';
+      currentCharge.description  = row[2] || '';
+      currentCharge.type         = row[3] || '';
+      currentCharge.counts       = row[4] || '';
+      currentCharge.bond         = row[5] || '';
+    }
+  }
+  if (currentCharge) charges.push(currentCharge);
+
+  const relIdx     = allRows.findIndex(r => r.some(c => /^release date$/i.test(c.trim())));
+  const releaseRow = relIdx >= 0 ? (allRows[relIdx + 1] || []) : [];
+
+  let height = physicalRow[0] || '';
+  if (/^\d{3,4}$/.test(height)) {
+    const h = height.padStart(3, '0');
+    height = `${h[0]}'${h.slice(1)}"`;
+  }
+
+  const RACE_MAP = { B:'Black', W:'White', H:'Hispanic', A:'Asian', O:'Other', I:'Indigenous', U:'Unknown' };
+  const raceSex  = (personalRow[2] || '').replace(/\s/g, '');
+  const [rc, sc] = raceSex.split('/');
+  const race     = RACE_MAP[rc] || rc || '';
+  const sex      = sc === 'M' ? 'Male' : sc === 'F' ? 'Female' : sc || '';
+
+  const rawSoid = (personalRow[4] || '').trim();
+  const eventId = rawSoid ? String(parseInt(rawSoid.replace(/\D/g, ''), 10)) : '';
+
+  const firstCharge = charges[0] || {};
+  const chargesDesc = charges.map(c => c.description).filter(Boolean).join('; ');
+  const chargeType  = [...new Set(charges.map(c => {
     const t = (c.type || '').toLowerCase();
     if (t.includes('felony'))      return 'Felony';
     if (t.includes('misdemeanor')) return 'Misdemeanor';
     return c.type;
   }).filter(Boolean))].join('; ');
 
-  const rawSoid = (detail.soid || summaryRow.soid || '').trim();
-  const eventId = rawSoid ? String(parseInt(rawSoid.replace(/\D/g, ''), 10)) : '';
-  const firstCharge = detail.charges[0] || {};
-
   return {
-    event_id:             eventId,
-    full_name:            detail.full_name || summaryRow.name || '',
-    original_name:        originalName || '',
-    county:               'Cobb',
-    agency_id:            detail.agency_id,
-    arrest_date_time:     detail.arrest_date_time,
-    booking_date:         detail.booking_started,
-    end_of_booking_date:  detail.booking_complete,
-    booking_number:       detail.serial_number,
-    date_of_birth:        detail.dob || summaryRow.dob || '',
+    event_id:            eventId,
+    full_name:           personalRow[0] || '',
+    original_name:       originalName   || '',
+    county:              'Cobb',
+    agency_id:           bookingRow[0]  || '',
+    arrest_date_time:    bookingRow[1]  || '',
+    booking_date:        bookingRow[2]  || '',
+    end_of_booking_date: bookingRow[3]  || '',
+    booking_number:      arrestRow[3]   || '',
+    date_of_birth:       personalRow[1] || '',
     race,
     sex,
-    height:               detail.height,
-    weight:               detail.weight,
-    hair:                 detail.hair,
-    eyes:                 detail.eyes,
-    address:              [detail.address, detail.city, detail.state, detail.zip].filter(Boolean).join(', '),
-    place_of_birth:       detail.place_of_birth,
-    custody_status:       detail.location || summaryRow.location || '',
-    is_released:          detail.is_released,
-    days_in_custody:      detail.days_in_custody || summaryRow.days_in_custody || '',
-    release_date:         detail.release_date,
-    release_officer:      detail.release_officer,
-    released_to:          detail.released_to,
-    arresting_agency:     detail.arresting_agency,
-    arrest_officer:       detail.arrest_officer,
-    location_of_arrest:   detail.location_of_arrest,
-    charges:              chargesDesc,
-    charge_type:          chargeType,
-    charges_detail:       detail.charges,
-    bonding_amount:       firstCharge.bond_amount || '',
-    bond_status:          firstCharge.bond_status || '',
-    bonding_company:      '',
-    bondsman_name:        '',
-    warrant:              firstCharge.warrant || '',
-    case_number:          firstCharge.case_number || '',
-    otn:                  firstCharge.otn || '',
-    disposition:          firstCharge.disposition || '',
-    attorney:             detail.attorney,
-    processed:            false,
-    locked:               false,
-    scraped_at:           new Date().toISOString(),
-  };
-}
-
-function buildSummaryRecord(row, originalName) {
-  const rawSoid = (row.soid || '').trim();
-  const eventId = rawSoid ? String(parseInt(rawSoid.replace(/\D/g, ''), 10)) : '';
-  const race    = RACE_MAP[(row.race || '').trim()] || row.race || '';
-  const sex     = row.sex === 'M' ? 'Male' : row.sex === 'F' ? 'Female' : row.sex || '';
-  return {
-    event_id: eventId, full_name: row.name, original_name: originalName,
-    county: 'Cobb', date_of_birth: row.dob, race, sex,
-    custody_status: row.location, is_released: (row.location || '').toUpperCase() === 'RELEASED',
-    days_in_custody: row.days_in_custody,
-    charges: '', charge_type: '', bonding_amount: '', bond_status: '',
-    processed: false, locked: false, scraped_at: new Date().toISOString(),
+    height,
+    weight:              physicalRow[1] || '',
+    hair:                physicalRow[2] || '',
+    eyes:                physicalRow[3] || '',
+    address:             [addressRow[0], addressRow[1], addressRow[2], addressRow[3]].filter(Boolean).join(', '),
+    place_of_birth:      findVal('place of birth'),
+    custody_status:      personalRow[3] || '',
+    is_released:         !txt.includes('not released'),
+    days_in_custody:     personalRow[5] || '',
+    release_date:        releaseRow[0]  || '',
+    release_officer:     releaseRow[1]  || '',
+    released_to:         releaseRow[2]  || '',
+    arresting_agency:    arrestRow[0]   || '',
+    arrest_officer:      arrestRow[1]   || '',
+    location_of_arrest:  arrestRow[2]   || '',
+    charges:             chargesDesc,
+    charge_type:         chargeType,
+    charges_detail:      charges,
+    bonding_amount:      firstCharge.bond_amount || '',
+    bond_status:         firstCharge.bond_status || '',
+    bonding_company:     '',
+    bondsman_name:       '',
+    warrant:             firstCharge.warrant     || '',
+    case_number:         firstCharge.case_number || '',
+    otn:                 firstCharge.otn         || '',
+    disposition:         firstCharge.disposition || '',
+    attorney:            txt.includes('no attorney of record') ? '' : findVal('attorney'),
+    processed:           false,
+    locked:              false,
+    scraped_at:          new Date().toISOString(),
   };
 }
 
 app.get('/health', async (req, res) => {
-  try {
-    const r = await getSessionCookie();
-    res.json({ status: 'ok', proxy: `${PROXY_HOST}:${PROXY_PORT}`, site_reachable: true, cookies: r.cookies.length, timestamp: new Date().toISOString() });
-  } catch (err) {
-    res.json({ status: 'degraded', error: err.message, proxy: `${PROXY_HOST}:${PROXY_PORT}`, hint: 'Update PROXY_HOST/PROXY_PORT/PROXY_USER/PROXY_PASS in Railway Variables', timestamp: new Date().toISOString() });
-  }
+  const browser = await launchBrowser().catch(() => null);
+  if (!browser) return res.json({ status: 'degraded', error: 'Browser launch failed' });
+  await browser.close();
+  res.json({ status: 'ok', proxy: `${PROXY_HOST}:${PROXY_PORT}`, timestamp: new Date().toISOString() });
 });
 
 app.get('/proxy-test', async (req, res) => {
   const t = Date.now();
+  let browser;
   try {
-    const r = await proxyRequest({ targetUrl: FORM_URL });
-    res.json({ ok: r.status === 200, proxy: `${PROXY_HOST}:${PROXY_PORT}`, http_status: r.status, body_length: r.body.length, cookies: r.cookies, ms: Date.now() - t });
+    browser = await launchBrowser();
+    const ctx  = await newContext(browser);
+    const page = await ctx.newPage();
+    await page.goto(BASE_URL + '/enter_name.shtm', { waitUntil: 'domcontentloaded', timeout: 30000 });
+    const title = await page.title();
+    const html  = (await page.content()).length;
+    await ctx.close();
+    await browser.close();
+    res.json({ ok: true, proxy: `${PROXY_HOST}:${PROXY_PORT}`, page_title: title, html_length: html, ms: Date.now() - t });
   } catch (err) {
+    if (browser) await browser.close().catch(() => {});
     res.json({ ok: false, proxy: `${PROXY_HOST}:${PROXY_PORT}`, error: err.message, ms: Date.now() - t,
-      hint: '"socket hang up" = proxy IP dead. "407" = wrong credentials. Fix env vars in Railway.' });
+      hint: 'Check PROXY_HOST/PROXY_PORT/PROXY_USER/PROXY_PASS in Railway Variables' });
   }
 });
 
 app.post('/scrape', async (req, res) => {
-  const { name, soid } = req.body;
+  const { name, soid } = req.body || {};
   if (!name && !soid) return res.status(400).json({ success: false, error: 'Provide name or soid' });
 
   const searchName = name ? formatName(name) : '';
-  console.log(`\n[scrape] ── START "${name || soid}" → search:"${searchName}" ──`);
+  console.log(`\n[scrape] ── "${name || soid}" → "${searchName}" ──`);
 
-  let browser;
   try {
-    browser = await launchBrowser();
-
-    console.log('[scrape] Step 1 — session cookie');
-    const session = await withRetry(() => getSessionCookie(), 3, 3000);
-    let cookies = session.cookies;
-
-    console.log('[scrape] Step 2 — submit search (qry=Inquiry)');
-    const searchResult = await withRetry(() => submitSearch(cookies, searchName, soid), 2, 2000);
-    cookies = searchResult.cookies;
-
-    let resultsHtml = searchResult.body;
-    if (searchResult.status === 301 || searchResult.status === 302) {
-      const loc  = searchResult.location || '';
-      const dest = loc.startsWith('http') ? loc : BASE_URL + loc;
-      console.log(`[scrape] redirect → ${dest}`);
-      const redir = await getPage(dest, cookies, BASE_URL + '/inquiry.asp');
-      resultsHtml = redir.body;
-      cookies     = redir.cookies;
-    }
-    console.log(`[scrape] results HTML: ${resultsHtml.length} chars`);
-
-    console.log('[scrape] Step 3 — parse results');
-    const { page: rPage, ctx: rCtx } = await parseHtml(browser, resultsHtml);
-
-    const bodyText = (await rPage.textContent('body').catch(() => '')).toLowerCase();
-    const hasTable = (await rPage.$('table')) !== null;
-
-    if (!hasTable || bodyText.includes('no record') || bodyText.includes('no match') || bodyText.includes('not found')) {
-      await rCtx.close(); await browser.close();
-      console.log('[scrape] No results found');
-      return res.json({ success: true, found: false, name: name || soid, data: null });
-    }
-
-    const rows = await parseResultsPage(rPage);
-    await rCtx.close();
-    console.log(`[scrape] Found ${rows.length} row(s): ${JSON.stringify(rows.map(r => r.name))}`);
-
-    if (!rows.length) {
-      await browser.close();
-      return res.json({ success: true, found: false, name: name || soid, data: null });
-    }
-
-    const summaryRow = rows[0];
-    console.log(`[scrape] Using: "${summaryRow.name}" SOID:${summaryRow.soid} BookingID:${summaryRow.booking_id}`);
-
-    if (!summaryRow.booking_id && !summaryRow.detail_url) {
-      console.log('[scrape] No BOOKING_ID — returning summary only');
-      await browser.close();
-      return res.json({ success: true, found: true, detail: false, data: buildSummaryRecord(summaryRow, name || soid) });
-    }
-
-    let detailUrl;
-    if (summaryRow.detail_url) {
-      detailUrl = summaryRow.detail_url.startsWith('http')
-        ? summaryRow.detail_url
-        : BASE_URL + '/' + summaryRow.detail_url.replace(/^\//, '');
-    } else {
-      const s = encodeURIComponent((summaryRow.soid_from_form || summaryRow.soid || '').trim());
-      const b = encodeURIComponent(summaryRow.booking_id);
-      detailUrl = `${BASE_URL}/InmDetails.asp?soid=${s}&BOOKING_ID=${b}`;
-    }
-
-    console.log(`[scrape] Step 4 — detail: ${detailUrl}`);
-    const detailResult = await getPage(detailUrl, cookies, BASE_URL + '/inquiry.asp');
-
-    if (!detailResult.body || detailResult.body.includes('Error_Page') || detailResult.body.includes('Unauthorised')) {
-      console.log('[scrape] Detail page error — summary only');
-      await browser.close();
-      return res.json({ success: true, found: true, detail: false, data: buildSummaryRecord(summaryRow, name || soid) });
-    }
-
-    console.log('[scrape] Step 5 — parse detail page');
-    const { page: dPage, ctx: dCtx } = await parseHtml(browser, detailResult.body);
-    const detail = await parseDetailPage(dPage);
-    await dCtx.close();
-    await browser.close();
-
-    const record = buildRecord(detail, summaryRow, name || soid);
-    console.log(`[scrape] ✅ ${record.full_name} | booking:${record.booking_date} | charges:${record.charges.substring(0, 80)}`);
-
-    return res.json({
-      success:    true,
-      found:      true,
-      detail:     true,
-      detail_url: detailUrl,
-      scraped_at: new Date().toISOString(),
-      data:       record,
-    });
-
+    const result = await scrapeInmate(searchName, soid || '');
+    return res.json({ success: true, ...result });
   } catch (err) {
-    if (browser) await browser.close().catch(() => {});
-    console.error(`[scrape] ❌ "${name || soid}": ${err.message}`);
+    console.error(`[scrape] ❌ ${err.message}`);
     return res.status(500).json({
       success: false,
-      found:   false,
       error:   err.message,
       name:    name || soid || '',
-      hint:    (err.message.includes('timed out') || err.message.includes('socket hang up'))
-        ? 'Proxy is dead. Update PROXY_HOST/PROXY_PORT/PROXY_USER/PROXY_PASS in Railway Variables.'
+      hint:    err.message.includes('timeout') || err.message.includes('ERR_')
+        ? 'Proxy issue. Check PROXY_HOST/PROXY_PORT/PROXY_USER/PROXY_PASS in Railway Variables.'
         : undefined,
     });
   }
 });
 
 app.post('/admissions', async (req, res) => {
+  const url = BASE_URL + '/inquiry.asp?soid=&inmate_name=&serial=&qry=Admissions';
   let browser;
   try {
-    const session = await withRetry(() => getSessionCookie(), 3, 3000);
-    const result  = await getPage(
-      BASE_URL + '/inquiry.asp?soid=&inmate_name=&serial=&qry=Admissions',
-      session.cookies, FORM_URL
-    );
     browser = await launchBrowser();
-    const { page, ctx } = await parseHtml(browser, result.body);
-    await page.waitForSelector('table', { timeout: 10000 }).catch(() => {});
+    const ctx  = await newContext(browser);
+    const page = await ctx.newPage();
+    await page.goto(url, { waitUntil: 'networkidle', timeout: 90000 });
+    await sleep(2000);
     const inmates = await page.evaluate(() =>
       Array.from(document.querySelectorAll('table tr')).slice(1).map(row => {
         const c = Array.from(row.querySelectorAll('td')).map(td => (td.innerText || '').trim());
@@ -616,7 +393,8 @@ app.post('/admissions', async (req, res) => {
         return { name: c[1], dob: c[2], race: c[3], sex: c[4], location: c[5], soid: c[6], days_in_custody: c[7] };
       }).filter(Boolean)
     );
-    await ctx.close(); await browser.close();
+    await ctx.close();
+    await browser.close();
     res.json({ success: true, count: inmates.length, inmates });
   } catch (err) {
     if (browser) await browser.close().catch(() => {});
@@ -627,6 +405,5 @@ app.post('/admissions', async (req, res) => {
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`✅ Cobb County Scraper on port ${PORT}`);
   console.log(`   Proxy:  ${PROXY_HOST}:${PROXY_PORT}`);
-  console.log(`   Target: ${BASE_URL}`);
   console.log(`   Routes: GET /health  GET /proxy-test  POST /scrape  POST /admissions`);
 });
