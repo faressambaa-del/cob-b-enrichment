@@ -1,7 +1,6 @@
 const express    = require('express');
 const { chromium } = require('playwright');
 const http       = require('http');
-const https      = require('https');
 
 const app  = express();
 app.use(express.json());
@@ -11,153 +10,117 @@ const BASE_URL = 'http://inmate-search.cobbsheriff.org';
 const FORM_URL = BASE_URL + '/enter_name.shtm';
 
 // ─────────────────────────────────────────────────────────────
-// PROXY — used by node http requests to seed the ASP session
-// Playwright will use the same proxy config
+// PROXY — configurable via Railway environment variables.
+// Go to Railway → your service → Variables and set:
+//   PROXY_HOST, PROXY_PORT, PROXY_USER, PROXY_PASS
 // ─────────────────────────────────────────────────────────────
-const PROXY_HOST = '31.59.20.176';
-const PROXY_PORT = 6754;
-const PROXY_USER = 'tznskjmn';
-const PROXY_PASS = 'ag3c9yyj3w0l';
-const PROXY_URL  = `http://${PROXY_USER}:${PROXY_PASS}@${PROXY_HOST}:${PROXY_PORT}`;
-
-// ─────────────────────────────────────────────────────────────
-// GET SESSION COOKIE via raw Node HTTP through the proxy
-// This bypasses Playwright's CONNECT tunnel issue entirely.
-// We make a raw GET to the form page via the proxy using Node's
-// http module, extract Set-Cookie headers, then pass cookies
-// into the Playwright context.
-// ─────────────────────────────────────────────────────────────
-function getSessionCookie() {
-  return new Promise((resolve, reject) => {
-    const auth    = Buffer.from(`${PROXY_USER}:${PROXY_PASS}`).toString('base64');
-    const options = {
-      host:    PROXY_HOST,
-      port:    PROXY_PORT,
-      method:  'GET',
-      path:    FORM_URL,
-      headers: {
-        'Host':              'inmate-search.cobbsheriff.org',
-        'User-Agent':        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-        'Accept':            'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        'Accept-Language':   'en-US,en;q=0.9',
-        'Proxy-Authorization': `Basic ${auth}`,
-        'Connection':        'keep-alive'
-      }
-    };
-
-    const req = http.request(options, (resp) => {
-      const cookies = resp.headers['set-cookie'] || [];
-      let body = '';
-      resp.on('data', chunk => { body += chunk; });
-      resp.on('end', () => {
-        console.log(`[session] HTTP ${resp.statusCode} | cookies: ${JSON.stringify(cookies)} | body length: ${body.length}`);
-        resolve({ cookies, body, status: resp.statusCode });
-      });
-    });
-
-    req.on('error', (err) => {
-      console.log(`[session] Node HTTP error: ${err.message}`);
-      reject(err);
-    });
-
-    req.setTimeout(30000, () => {
-      req.destroy();
-      reject(new Error('Session request timed out'));
-    });
-
-    req.end();
-  });
-}
+const PROXY_HOST = process.env.PROXY_HOST || '31.59.20.176';
+const PROXY_PORT = parseInt(process.env.PROXY_PORT || '6754', 10);
+const PROXY_USER = process.env.PROXY_USER || 'tznskjmn';
+const PROXY_PASS = process.env.PROXY_PASS || 'ag3c9yyj3w0l';
 
 // ─────────────────────────────────────────────────────────────
-// SUBMIT SEARCH FORM via raw Node HTTP through proxy
-// Returns { cookies, body, status, location }
+// CORE HTTP via forward proxy
 // ─────────────────────────────────────────────────────────────
-function submitSearchForm(sessionCookies, searchName, soidVal) {
-  return new Promise((resolve, reject) => {
-    const auth       = Buffer.from(`${PROXY_USER}:${PROXY_PASS}`).toString('base64');
-    const nameParam  = soidVal ? '' : encodeURIComponent(searchName).replace(/%20/g, '+');
-    const soidParam  = soidVal ? encodeURIComponent(soidVal) : '';
-    const postBody   = `soid=${soidParam}&name=${nameParam}&serial=&B1=Search&qry=Inquiry`;
-    const cookieStr  = sessionCookies.map(c => c.split(';')[0]).join('; ');
-
-    const options = {
-      host:    PROXY_HOST,
-      port:    PROXY_PORT,
-      method:  'POST',
-      path:    BASE_URL + '/inquiry.asp',
-      headers: {
-        'Host':                  'inmate-search.cobbsheriff.org',
-        'User-Agent':            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-        'Accept':                'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        'Accept-Language':       'en-US,en;q=0.9',
-        'Content-Type':          'application/x-www-form-urlencoded',
-        'Content-Length':        Buffer.byteLength(postBody),
-        'Referer':               FORM_URL,
-        'Cookie':                cookieStr,
-        'Proxy-Authorization':   `Basic ${auth}`,
-        'Connection':            'keep-alive'
-      }
-    };
-
-    const req = http.request(options, (resp) => {
-      const newCookies = resp.headers['set-cookie'] || [];
-      const allCookies = [...sessionCookies, ...newCookies];
-      let body = '';
-      resp.on('data', chunk => { body += chunk; });
-      resp.on('end', () => {
-        console.log(`[form] POST ${resp.statusCode} | body: ${body.length} chars | location: ${resp.headers.location||'none'}`);
-        resolve({ cookies: allCookies, body, status: resp.statusCode, location: resp.headers.location });
-      });
-    });
-
-    req.on('error', reject);
-    req.setTimeout(30000, () => { req.destroy(); reject(new Error('Form submit timed out')); });
-    req.write(postBody);
-    req.end();
-  });
-}
-
-// ─────────────────────────────────────────────────────────────
-// GET PAGE via raw Node HTTP through proxy (for results/detail)
-// ─────────────────────────────────────────────────────────────
-function getPage(url, cookies) {
+function proxyRequest({ method = 'GET', targetUrl, postBody = null, cookies = [], extraHeaders = {} }) {
   return new Promise((resolve, reject) => {
     const auth      = Buffer.from(`${PROXY_USER}:${PROXY_PASS}`).toString('base64');
     const cookieStr = cookies.map(c => c.split(';')[0]).join('; ');
-    const options = {
-      host:    PROXY_HOST,
-      port:    PROXY_PORT,
-      method:  'GET',
-      path:    url,
-      headers: {
-        'Host':                  'inmate-search.cobbsheriff.org',
-        'User-Agent':            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-        'Accept':                'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        'Referer':               BASE_URL + '/inquiry.asp',
-        'Cookie':                cookieStr,
-        'Proxy-Authorization':   `Basic ${auth}`,
-        'Connection':            'keep-alive'
-      }
+
+    const headers = {
+      'Host':                new URL(targetUrl).host,
+      'User-Agent':          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+      'Accept':              'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+      'Accept-Language':     'en-US,en;q=0.9',
+      'Proxy-Authorization': `Basic ${auth}`,
+      'Connection':          'close',
+      ...extraHeaders,
     };
-    const req = http.request(options, (resp) => {
-      let body = '';
-      resp.on('data', chunk => { body += chunk; });
-      resp.on('end', () => {
-        console.log(`[http] GET ${url} → ${resp.statusCode} | ${body.length} chars`);
-        resolve({ body, status: resp.statusCode, cookies: resp.headers['set-cookie'] || [] });
-      });
-    });
+    if (cookieStr) headers['Cookie'] = cookieStr;
+    if (postBody) {
+      headers['Content-Type']   = 'application/x-www-form-urlencoded';
+      headers['Content-Length'] = Buffer.byteLength(postBody);
+    }
+
+    const req = http.request(
+      { host: PROXY_HOST, port: PROXY_PORT, method, path: targetUrl, headers },
+      (resp) => {
+        const setCookies = resp.headers['set-cookie'] || [];
+        let body = '';
+        resp.on('data', chunk => { body += chunk; });
+        resp.on('end', () => resolve({
+          status:   resp.statusCode,
+          headers:  resp.headers,
+          cookies:  setCookies,
+          location: resp.headers['location'] || null,
+          body,
+        }));
+      }
+    );
+
+    req.setTimeout(30000, () => req.destroy(new Error('Request timed out after 30s')));
     req.on('error', reject);
-    req.setTimeout(60000, () => { req.destroy(); reject(new Error('GET timed out: ' + url)); });
+    if (postBody) req.write(postBody);
     req.end();
   });
 }
 
 // ─────────────────────────────────────────────────────────────
-// PARSE HTML with Playwright (no navigation — just evaluate)
-// We load the HTML into a Playwright page using setContent()
-// so we get full DOM access without making any network requests
+// RETRY WRAPPER
+// ─────────────────────────────────────────────────────────────
+async function withRetry(fn, attempts = 3, delayMs = 3000) {
+  let lastErr;
+  for (let i = 0; i < attempts; i++) {
+    try { return await fn(); } catch (err) {
+      lastErr = err;
+      console.log(`[retry] attempt ${i + 1}/${attempts} failed: ${err.message}`);
+      if (i < attempts - 1) await new Promise(r => setTimeout(r, delayMs * (i + 1)));
+    }
+  }
+  throw lastErr;
+}
+
+// ─────────────────────────────────────────────────────────────
+// STEP 1: Get ASP session cookie
+// ─────────────────────────────────────────────────────────────
+async function getSessionCookie() {
+  console.log(`[session] GET ${FORM_URL} via ${PROXY_HOST}:${PROXY_PORT}`);
+  const result = await proxyRequest({ targetUrl: FORM_URL });
+  console.log(`[session] HTTP ${result.status} | cookies: ${JSON.stringify(result.cookies)} | body: ${result.body.length} chars`);
+  if (result.status === 407) throw new Error('Proxy auth failed (407). Update PROXY_USER/PROXY_PASS env vars.');
+  if (result.body.toLowerCase().includes('bad gateway')) throw new Error('Proxy bad gateway. Check PROXY_HOST/PROXY_PORT env vars.');
+  if (result.status !== 200) throw new Error(`Unexpected status ${result.status} from session GET`);
+  return { cookies: result.cookies, body: result.body, status: result.status };
+}
+
+// ─────────────────────────────────────────────────────────────
+// STEP 2: Submit search form
+// ─────────────────────────────────────────────────────────────
+async function submitSearchForm(sessionCookies, searchName, soidVal) {
+  const nameParam = soidVal ? '' : encodeURIComponent(searchName).replace(/%20/g, '+');
+  const soidParam = soidVal ? encodeURIComponent(soidVal) : '';
+  const postBody  = `soid=${soidParam}&name=${nameParam}&serial=&B1=Search&qry=Inquiry`;
+  console.log(`[form] POST /inquiry.asp | ${postBody}`);
+  const result = await proxyRequest({
+    method: 'POST', targetUrl: BASE_URL + '/inquiry.asp',
+    postBody, cookies: sessionCookies,
+    extraHeaders: { 'Referer': FORM_URL, 'Origin': BASE_URL },
+  });
+  console.log(`[form] ${result.status} | ${result.body.length} chars | loc: ${result.location || 'none'}`);
+  return { ...result, cookies: [...sessionCookies, ...result.cookies] };
+}
+
+// ─────────────────────────────────────────────────────────────
+// GET any page via proxy
+// ─────────────────────────────────────────────────────────────
+async function getPage(url, cookies, referer) {
+  const result = await proxyRequest({ targetUrl: url, cookies, extraHeaders: referer ? { 'Referer': referer } : {} });
+  console.log(`[http] GET ${url} → ${result.status} | ${result.body.length} chars`);
+  return { ...result, cookies: [...cookies, ...result.cookies] };
+}
+
+// ─────────────────────────────────────────────────────────────
+// Parse HTML offline with Playwright (no network calls)
 // ─────────────────────────────────────────────────────────────
 async function parseHtml(browser, html) {
   const context = await browser.newContext();
@@ -166,13 +129,10 @@ async function parseHtml(browser, html) {
   return { page, context };
 }
 
-// ─────────────────────────────────────────────────────────────
-// LAUNCH BROWSER — no proxy needed since we do HTTP manually
-// ─────────────────────────────────────────────────────────────
 async function launchBrowser() {
   return chromium.launch({
     headless: true,
-    args: ['--no-sandbox','--disable-setuid-sandbox','--disable-dev-shm-usage','--disable-gpu','--no-first-run','--no-zygote','--single-process']
+    args: ['--no-sandbox','--disable-setuid-sandbox','--disable-dev-shm-usage','--disable-gpu','--no-first-run','--no-zygote','--single-process'],
   });
 }
 
@@ -192,14 +152,42 @@ function formatName(raw) {
 app.get('/health', async (req, res) => {
   try {
     const result = await getSessionCookie();
-    res.json({ status: 'ok', port: PORT, proxy: PROXY_URL.replace(PROXY_PASS,'***'), site_reachable: result.status === 200, cookies: result.cookies.length, timestamp: new Date().toISOString() });
+    res.json({ status: 'ok', proxy: `${PROXY_HOST}:${PROXY_PORT}`, site_reachable: result.status === 200, cookies: result.cookies.length, timestamp: new Date().toISOString() });
   } catch (err) {
-    res.json({ status: 'degraded', error: err.message, timestamp: new Date().toISOString() });
+    res.json({ status: 'degraded', error: err.message, proxy: `${PROXY_HOST}:${PROXY_PORT}`, hint: 'Update PROXY_HOST/PROXY_PORT/PROXY_USER/PROXY_PASS env vars in Railway', timestamp: new Date().toISOString() });
   }
 });
 
 // ─────────────────────────────────────────────────────────────
-// /scrape
+// /proxy-test — raw diagnostic endpoint
+// Hit this first when things break to check proxy health
+// ─────────────────────────────────────────────────────────────
+app.get('/proxy-test', async (req, res) => {
+  const start = Date.now();
+  try {
+    const result = await proxyRequest({ targetUrl: FORM_URL });
+    res.json({
+      proxy: `${PROXY_HOST}:${PROXY_PORT}`,
+      http_status: result.status,
+      body_length: result.body.length,
+      cookies: result.cookies,
+      duration_ms: Date.now() - start,
+      proxy_error: result.body.toLowerCase().includes('bad gateway'),
+      ok: result.status === 200,
+    });
+  } catch (err) {
+    res.json({
+      proxy: `${PROXY_HOST}:${PROXY_PORT}`,
+      error: err.message,
+      duration_ms: Date.now() - start,
+      ok: false,
+      hint: '"socket hang up" = proxy unreachable (dead IP or wrong port). "407" = bad credentials. Fix env vars in Railway.',
+    });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────
+// /scrape  POST { name: "GARCIA ELVIA" } or { soid: "123456" }
 // ─────────────────────────────────────────────────────────────
 app.post('/scrape', async (req, res) => {
   const { name, soid } = req.body;
@@ -212,58 +200,40 @@ app.post('/scrape', async (req, res) => {
   try {
     browser = await launchBrowser();
 
-    // ── Step 1: Get ASP session cookie via raw HTTP ───────────
     console.log('[scrape] Step 1 — getting session cookie');
-    const session = await getSessionCookie();
-    if (!session.cookies.length) {
-      console.log('[scrape] ⚠️  No session cookie returned — proceeding anyway');
-    }
+    const session = await withRetry(() => getSessionCookie(), 3, 3000);
     let cookies = session.cookies;
-    console.log(`[scrape] Session cookies: ${JSON.stringify(cookies.map(c => c.split(';')[0]))}`);
+    console.log(`[scrape] Cookies: ${JSON.stringify(cookies.map(c => c.split(';')[0]))}`);
 
-    // Check we got a real page, not a proxy error
-    if (session.body.includes('Bad gateway') || session.body.includes('bad gateway')) {
-      throw new Error('Proxy bad gateway on form page');
-    }
-
-    // ── Step 2: Submit search form via raw HTTP ───────────────
     console.log('[scrape] Step 2 — submitting search form');
-    const formResult = await submitSearchForm(cookies, searchName, soid);
+    const formResult = await withRetry(() => submitSearchForm(cookies, searchName, soid), 2, 2000);
     cookies = formResult.cookies;
 
-    // Handle redirect if any
     let resultsHtml = formResult.body;
     if (formResult.status === 302 || formResult.status === 301) {
-      const redirectUrl = formResult.location.startsWith('http')
-        ? formResult.location
-        : BASE_URL + formResult.location;
-      console.log(`[scrape] Following redirect → ${redirectUrl}`);
-      const redirectResult = await getPage(redirectUrl, cookies);
-      resultsHtml = redirectResult.body;
-      cookies = [...cookies, ...redirectResult.cookies];
+      const loc = formResult.location || '';
+      const redirectUrl = loc.startsWith('http') ? loc : BASE_URL + loc;
+      console.log(`[scrape] Redirect → ${redirectUrl}`);
+      const redir = await getPage(redirectUrl, cookies, BASE_URL + '/inquiry.asp');
+      resultsHtml = redir.body;
+      cookies = redir.cookies;
     }
-
     console.log(`[scrape] Results HTML: ${resultsHtml.length} chars`);
 
-    // ── Step 3: Parse results page ────────────────────────────
-    const { page: resultsPage, context: rCtx } = await parseHtml(browser, resultsHtml);
+    const { page: rPage, context: rCtx } = await parseHtml(browser, resultsHtml);
+    const bodyText = await rPage.textContent('body').catch(() => '');
+    const hasTable = (await rPage.$('table')) !== null;
 
-    const bodyText = await resultsPage.textContent('body');
-    const hasTable = await resultsPage.$('table') !== null;
-
-    if (!hasTable || bodyText.toLowerCase().includes('no record') || bodyText.toLowerCase().includes('no match')) {
-      await rCtx.close();
+    if (!hasTable || bodyText.toLowerCase().includes('no record') || bodyText.toLowerCase().includes('no match') || bodyText.toLowerCase().includes('not found')) {
+      await rCtx.close(); await browser.close();
       console.log(`[scrape] No results for: ${searchName || soid}`);
-      await browser.close();
       return res.json({ success: true, found: false, name: name || soid, data: null });
     }
 
-    // Parse summary row
-    const summaryRow = await resultsPage.evaluate(() => {
+    const summaryRow = await rPage.evaluate(() => {
       for (const row of document.querySelectorAll('table tr')) {
-        const cells = Array.from(row.querySelectorAll('td')).map(td => td.innerText.trim());
-        if (cells.length >= 7 && cells[1] && cells[1].length > 2 &&
-            !cells[1].toLowerCase().includes('name') && !cells[1].toLowerCase().includes('image')) {
+        const cells = Array.from(row.querySelectorAll('td')).map(td => (td.innerText || '').trim());
+        if (cells.length >= 6 && cells[1] && cells[1].length > 2 && !cells[1].toLowerCase().includes('name') && !cells[1].toLowerCase().includes('image')) {
           return { name: cells[1]||'', dob: cells[2]||'', race: cells[3]||'', sex: cells[4]||'', location: cells[5]||'', soid: cells[6]||'', days_in_custody: cells[7]||'' };
         }
       }
@@ -271,14 +241,12 @@ app.post('/scrape', async (req, res) => {
     });
 
     if (!summaryRow) {
-      await rCtx.close();
-      await browser.close();
+      await rCtx.close(); await browser.close();
       return res.json({ success: true, found: false, name: name || soid, data: null });
     }
-    console.log(`[scrape] Found: "${summaryRow.name}" SOID:${summaryRow.soid} Location:${summaryRow.location}`);
+    console.log(`[scrape] Found: "${summaryRow.name}" SOID:${summaryRow.soid}`);
 
-    // Extract BOOKING_ID from the results page forms
-    const bookingInfo = await resultsPage.evaluate(() => {
+    const bookingInfo = await rPage.evaluate(() => {
       for (const form of document.querySelectorAll('form')) {
         const action = (form.action || form.getAttribute('action') || '').toLowerCase();
         if (!action.includes('inmdetails') && !action.includes('inm_details')) continue;
@@ -286,17 +254,13 @@ app.post('/scrape', async (req, res) => {
         form.querySelectorAll('input').forEach(i => { inputs[(i.name||'').toUpperCase()] = i.value; });
         if (inputs['BOOKING_ID']) return { soid: inputs['SOID']||'', bookingId: inputs['BOOKING_ID'] };
       }
-      // Scan all inputs
       const all = {};
       document.querySelectorAll('input').forEach(i => { all[(i.name||'').toUpperCase()] = i.value; });
       if (all['BOOKING_ID']) return { soid: all['SOID']||'', bookingId: all['BOOKING_ID'] };
-      // href link
       for (const a of document.querySelectorAll('a')) {
-        if ((a.href||'').toLowerCase().includes('inmdetails')) return { href: a.href };
+        const href = a.href || a.getAttribute('href') || '';
+        if (href.toLowerCase().includes('inmdetails')) return { href };
       }
-      // Log all forms for debug
-      const debug = { forms: Array.from(document.querySelectorAll('form')).map(f => ({ action: f.action, inputs: Array.from(f.querySelectorAll('input')).map(i => i.name+'='+i.value) })), links: Array.from(document.querySelectorAll('a')).map(a => a.href).slice(0,10) };
-      console.log('BOOKING_DEBUG:' + JSON.stringify(debug));
       return null;
     });
 
@@ -304,47 +268,49 @@ app.post('/scrape', async (req, res) => {
     console.log(`[scrape] bookingInfo: ${JSON.stringify(bookingInfo)}`);
 
     if (!bookingInfo || (!bookingInfo.bookingId && !bookingInfo.href)) {
-      console.log('[scrape] No BOOKING_ID found — returning summary only');
+      console.log('[scrape] No BOOKING_ID — returning summary only');
       await browser.close();
       return res.json({ success: true, found: true, data: buildBasicData(summaryRow, name||soid) });
     }
 
-    // ── Step 4: Get detail page via raw HTTP ──────────────────
     let detailUrl;
     if (bookingInfo.href) {
       detailUrl = bookingInfo.href.startsWith('http') ? bookingInfo.href : BASE_URL + '/' + bookingInfo.href.replace(/^\//, '');
     } else {
       const ds = (bookingInfo.soid || summaryRow.soid || '').trim();
-      detailUrl = BASE_URL + '/InmDetails.asp?soid=' + encodeURIComponent(ds) + '&BOOKING_ID=' + encodeURIComponent(bookingInfo.bookingId);
+      detailUrl = `${BASE_URL}/InmDetails.asp?soid=${encodeURIComponent(ds)}&BOOKING_ID=${encodeURIComponent(bookingInfo.bookingId)}`;
     }
-
-    console.log(`[scrape] Step 4 — Detail: ${detailUrl}`);
-    const detailResult = await getPage(detailUrl, cookies);
+    console.log(`[scrape] Step 4 — ${detailUrl}`);
+    const detailResult = await getPage(detailUrl, cookies, BASE_URL + '/inquiry.asp');
 
     if (detailResult.body.includes('Error_Page') || detailResult.body.includes('Unauthorised')) {
-      console.log('[scrape] Error page — returning summary only');
+      console.log('[scrape] Error page on detail — summary only');
       await browser.close();
       return res.json({ success: true, found: true, data: buildBasicData(summaryRow, name||soid) });
     }
 
-    // ── Step 5: Parse detail page ─────────────────────────────
-    const { page: detailPage, context: dCtx } = await parseHtml(browser, detailResult.body);
-    const detail = await parseDetailPage(detailPage);
+    const { page: dPage, context: dCtx } = await parseHtml(browser, detailResult.body);
+    const detail = await parseDetailPage(dPage);
     await dCtx.close();
     await browser.close();
 
-    console.log(`[scrape] ✅ ${detail.full_name || summaryRow.name} | booking:${detail.booking_started} | addr:${detail.address} | charges:${detail.charges_description.substring(0,60)}`);
+    console.log(`[scrape] ✅ ${detail.full_name || summaryRow.name} | booking:${detail.booking_started} | charges:${detail.charges_description.substring(0,60)}`);
     return res.json({ success: true, found: true, detail_url: detailUrl, scraped_at: new Date().toISOString(), data: buildRecord(detail, summaryRow, name||soid) });
 
   } catch (err) {
     if (browser) await browser.close().catch(() => {});
     console.error(`[scrape] ❌ "${name||soid}": ${err.message}`);
-    return res.status(500).json({ success: false, found: false, error: err.message, name: name||soid||'' });
+    return res.status(500).json({
+      success: false, found: false, error: err.message, name: name||soid||'',
+      hint: (err.message.includes('timed out') || err.message.includes('socket hang up'))
+        ? 'Proxy is unreachable. Go to Railway → Variables and update PROXY_HOST/PROXY_PORT/PROXY_USER/PROXY_PASS with a working proxy.'
+        : undefined,
+    });
   }
 });
 
 // ─────────────────────────────────────────────────────────────
-// PARSE DETAIL PAGE — cell-by-cell, immune to nested tables
+// PARSE DETAIL PAGE
 // ─────────────────────────────────────────────────────────────
 async function parseDetailPage(page) {
   return page.evaluate(() => {
@@ -359,10 +325,7 @@ async function parseDetailPage(page) {
           sib = sib.nextElementSibling;
         }
         const tr = all[i].closest('tr');
-        if (tr && tr.nextElementSibling) {
-          const td = tr.nextElementSibling.querySelector('td, th');
-          if (td) return (td.innerText||'').trim();
-        }
+        if (tr && tr.nextElementSibling) { const td = tr.nextElementSibling.querySelector('td, th'); if (td) return (td.innerText||'').trim(); }
       }
       return '';
     }
@@ -371,8 +334,7 @@ async function parseDetailPage(page) {
       for (let i = 0; i < all.length; i++) {
         if ((all[i].innerText||'').trim().toLowerCase() !== label.toLowerCase()) continue;
         const tr = all[i].closest('tr');
-        if (tr && tr.nextElementSibling)
-          return Array.from(tr.nextElementSibling.querySelectorAll('td, th')).map(td => (td.innerText||'').trim());
+        if (tr && tr.nextElementSibling) return Array.from(tr.nextElementSibling.querySelectorAll('td, th')).map(td => (td.innerText||'').trim());
       }
       return [];
     }
@@ -414,13 +376,13 @@ async function parseDetailPage(page) {
       case_warrant:bmanRow[0]||'', bondsman_name:bmanRow[1]||'',
       attorney:bodyText.includes('No Attorney of Record')?'':val('attorney'),
       release_date:relRow[0]||'', release_officer:relRow[1]||'', released_to:relRow[2]||'',
-      is_released:!bodyText.includes('Not Released')&&!location.toLowerCase().includes('jail')
+      is_released:!bodyText.includes('Not Released')&&!location.toLowerCase().includes('jail'),
     };
   });
 }
 
 function buildRecord(detail, summaryRow, originalName) {
-  const rsp=( detail.race_sex||'').replace(/\s/g,'').split('/');
+  const rsp=(detail.race_sex||'').replace(/\s/g,'').split('/');
   const raceMap={B:'Black',W:'White',H:'Hispanic',A:'Asian',O:'Other',I:'Indigenous',U:'Unknown'};
   const race=raceMap[rsp[0]]||rsp[0]||summaryRow.race||'';
   const sexRaw=rsp[1]||summaryRow.sex||'';
@@ -443,7 +405,7 @@ function buildRecord(detail, summaryRow, originalName) {
     processed:false, locked:false, scraped_at:new Date().toISOString(),
     warrant:detail.warrant||'', case_number:detail.case_number||'', otn:detail.otn||'',
     disposition:detail.disposition||'', arrest_date_time:detail.arrest_date_time||'',
-    agency_id:detail.agency_id||'', charges_detail:detail.charges||[]
+    agency_id:detail.agency_id||'', charges_detail:detail.charges||[],
   };
 }
 
@@ -460,27 +422,29 @@ function buildBasicData(summaryRow, originalName) {
     is_released:(summaryRow.location||'').toUpperCase()==='RELEASED',
     bonding_amount:'', bonding_company:'', booking_date:'',
     date_of_birth:summaryRow.dob||'', days_in_custody:summaryRow.days_in_custody||'',
-    race, sex, processed:false, locked:false, scraped_at:new Date().toISOString()
+    race, sex, processed:false, locked:false, scraped_at:new Date().toISOString(),
   };
 }
 
+// ─────────────────────────────────────────────────────────────
+// /admissions
+// ─────────────────────────────────────────────────────────────
 app.post('/admissions', async (req, res) => {
   let browser;
   try {
-    const session = await getSessionCookie();
-    const result  = await getPage(BASE_URL + '/inquiry.asp?soid=&inmate_name=&serial=&qry=Admissions', session.cookies);
+    const session = await withRetry(() => getSessionCookie(), 3, 3000);
+    const result  = await getPage(BASE_URL + '/inquiry.asp?soid=&inmate_name=&serial=&qry=Admissions', session.cookies, FORM_URL);
     browser = await launchBrowser();
     const { page, context } = await parseHtml(browser, result.body);
     await page.waitForSelector('table', { timeout: 10000 }).catch(() => {});
     const inmates = await page.evaluate(() =>
       Array.from(document.querySelectorAll('table tr')).slice(1).map(row => {
-        const cells = Array.from(row.querySelectorAll('td')).map(c => c.innerText.trim());
+        const cells = Array.from(row.querySelectorAll('td')).map(c => (c.innerText||'').trim());
         if (!cells[1]||cells[1].length<2) return null;
         return { name:cells[1]||'', dob:cells[2]||'', race:cells[3]||'', sex:cells[4]||'', location:cells[5]||'', soid:cells[6]||'', days_in_custody:cells[7]||'' };
       }).filter(Boolean)
     );
-    await context.close();
-    await browser.close();
+    await context.close(); await browser.close();
     res.json({ success:true, count:inmates.length, inmates });
   } catch (err) {
     if (browser) await browser.close().catch(() => {});
@@ -489,7 +453,17 @@ app.post('/admissions', async (req, res) => {
 });
 
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`Cobb County Scraper on port ${PORT}`);
-  console.log(`Proxy: ${PROXY_HOST}:${PROXY_PORT}`);
-  console.log(`BASE_URL: ${BASE_URL}`);
+  console.log(`✅ Cobb County Scraper on port ${PORT}`);
+  console.log(`   Proxy: ${PROXY_HOST}:${PROXY_PORT}`);
+  console.log(`   Endpoints: GET /health  GET /proxy-test  POST /scrape  POST /admissions`);
 });
+```
+
+---
+
+That's everything. After pasting, **the most important step**: go to **Railway → your service → Variables** and add a working proxy:
+```
+PROXY_HOST = <new proxy ip>
+PROXY_PORT = <port>
+PROXY_USER = <username>
+PROXY_PASS = <password>
