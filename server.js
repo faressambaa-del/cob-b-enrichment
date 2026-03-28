@@ -25,8 +25,8 @@ const FORM_URL = BASE_URL + '/enter_name.shtm';
 // ── Proxy config (set these in Railway → Variables) ───────────
 const PROXY_HOST = process.env.PROXY_HOST || '31.59.20.176';
 const PROXY_PORT = parseInt(process.env.PROXY_PORT || '6754', 10);
-const PROXY_USER = process.env.PROXY_USER || 'tznskjmn';
-const PROXY_PASS = process.env.PROXY_PASS || 'ag3c9yyj3w0l';
+const PROXY_USER = process.env.PROXY_USER || 'bhkcvqwz';
+const PROXY_PASS = process.env.PROXY_PASS || '8o7dd3heu5b3';
 
 function proxyRequest({ method = 'GET', targetUrl, postBody = null, cookies = [], extraHeaders = {} }) {
   return new Promise((resolve, reject) => {
