@@ -65,7 +65,7 @@ async function scrapeInmate(searchName, soidVal) {
   const inquiryUrl = [
     BASE_URL + '/inquiry.asp',
     `?soid=${encodeURIComponent(soidVal || '')}`,
-    `&inmate_name=${encodeURIComponent(searchName || '')}`,
+    `&inmate_name=${encodeURIComponent(searchName || '').replace(/%20/g, '+')}`,
     `&serial=`,
     `&qry=Inquiry`,
   ].join('');
@@ -77,8 +77,8 @@ async function scrapeInmate(searchName, soidVal) {
   const page    = await context.newPage();
 
   try {
-    await page.goto(inquiryUrl, { waitUntil: 'networkidle', timeout: 90000 });
-    await sleep(3000);
+    await page.goto(inquiryUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    await sleep(5000);
 
     const pageText = await page.textContent('body').catch(() => '');
 
@@ -129,8 +129,8 @@ async function scrapeInmate(searchName, soidVal) {
         ? capturedUrl
         : BASE_URL + '/' + capturedUrl.replace(/^\//, '');
       console.log(`[scrape] Going to detail: ${fullUrl}`);
-      await page.goto(fullUrl, { waitUntil: 'networkidle', timeout: 90000 });
-      await sleep(3000);
+      await page.goto(fullUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+      await sleep(5000);
     } else {
       console.log('[scrape] No detail URL — parsing current page');
     }
@@ -384,8 +384,8 @@ app.post('/admissions', async (req, res) => {
     browser = await launchBrowser();
     const ctx  = await newContext(browser);
     const page = await ctx.newPage();
-    await page.goto(url, { waitUntil: 'networkidle', timeout: 90000 });
-    await sleep(2000);
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    await sleep(5000);
     const inmates = await page.evaluate(() =>
       Array.from(document.querySelectorAll('table tr')).slice(1).map(row => {
         const c = Array.from(row.querySelectorAll('td')).map(td => (td.innerText || '').trim());
