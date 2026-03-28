@@ -1,26 +1,36 @@
-const express    = require('express');
-const { chromium } = require('playwright');
-const http       = require('http');
+/**
+ * Cobb County Sheriff Inmate Scraper
+ *
+ * PAGE FLOW (matches screenshots exactly):
+ *  1. GET  /enter_name.shtm          → get ASP session cookie
+ *  2. POST /inquiry.asp              → search by name, qry=Inquiry (dropdown)
+ *     body: soid=&name=LASTNAME+FIRSTNAME&serial=&B1=Search&qry=Inquiry
+ *  3. Parse results table            → extract SOID + BOOKING_ID from
+ *                                       "Last Known Booking" button form
+ *  4. GET  /InmDetails.asp?soid=...&BOOKING_ID=...  → full booking detail page
+ *  5. Parse detail page              → all fields from Arrest/Booking Report
+ */
 
-const app  = express();
+const express      = require('express');
+const { chromium } = require('playwright');
+const http         = require('http');
+
+const app = express();
 app.use(express.json());
 
 const PORT     = process.env.PORT || 3000;
 const BASE_URL = 'http://inmate-search.cobbsheriff.org';
 const FORM_URL = BASE_URL + '/enter_name.shtm';
 
-// ─────────────────────────────────────────────────────────────
-// PROXY — configurable via Railway environment variables.
-// Go to Railway → your service → Variables and set:
-//   PROXY_HOST, PROXY_PORT, PROXY_USER, PROXY_PASS
-// ─────────────────────────────────────────────────────────────
+// ── Proxy config (set these in Railway → Variables) ───────────
 const PROXY_HOST = process.env.PROXY_HOST || '31.59.20.176';
 const PROXY_PORT = parseInt(process.env.PROXY_PORT || '6754', 10);
 const PROXY_USER = process.env.PROXY_USER || 'tznskjmn';
 const PROXY_PASS = process.env.PROXY_PASS || 'ag3c9yyj3w0l';
 
 // ─────────────────────────────────────────────────────────────
-// CORE HTTP via forward proxy
+// RAW HTTP via forward proxy
+// We connect to proxy and send the full target URL as the path.
 // ─────────────────────────────────────────────────────────────
 function proxyRequest({ method = 'GET', targetUrl, postBody = null, cookies = [], extraHeaders = {} }) {
   return new Promise((resolve, reject) => {
@@ -36,7 +46,7 @@ function proxyRequest({ method = 'GET', targetUrl, postBody = null, cookies = []
       'Connection':          'close',
       ...extraHeaders,
     };
-    if (cookieStr) headers['Cookie'] = cookieStr;
+    if (cookieStr)  headers['Cookie']          = cookieStr;
     if (postBody) {
       headers['Content-Type']   = 'application/x-www-form-urlencoded';
       headers['Content-Length'] = Buffer.byteLength(postBody);
@@ -45,19 +55,17 @@ function proxyRequest({ method = 'GET', targetUrl, postBody = null, cookies = []
     const req = http.request(
       { host: PROXY_HOST, port: PROXY_PORT, method, path: targetUrl, headers },
       (resp) => {
-        const setCookies = resp.headers['set-cookie'] || [];
         let body = '';
-        resp.on('data', chunk => { body += chunk; });
+        resp.on('data', c => { body += c; });
         resp.on('end', () => resolve({
           status:   resp.statusCode,
           headers:  resp.headers,
-          cookies:  setCookies,
+          cookies:  resp.headers['set-cookie'] || [],
           location: resp.headers['location'] || null,
           body,
         }));
       }
     );
-
     req.setTimeout(30000, () => req.destroy(new Error('Request timed out after 30s')));
     req.on('error', reject);
     if (postBody) req.write(postBody);
@@ -65,85 +73,548 @@ function proxyRequest({ method = 'GET', targetUrl, postBody = null, cookies = []
   });
 }
 
-// ─────────────────────────────────────────────────────────────
-// RETRY WRAPPER
-// ─────────────────────────────────────────────────────────────
+// ── Retry wrapper ─────────────────────────────────────────────
 async function withRetry(fn, attempts = 3, delayMs = 3000) {
   let lastErr;
   for (let i = 0; i < attempts; i++) {
     try { return await fn(); } catch (err) {
       lastErr = err;
-      console.log(`[retry] attempt ${i + 1}/${attempts} failed: ${err.message}`);
-      if (i < attempts - 1) await new Promise(r => setTimeout(r, delayMs * (i + 1)));
+      console.log(`[retry] ${i + 1}/${attempts}: ${err.message}`);
+      if (i < attempts - 1) await sleep(delayMs * (i + 1));
     }
   }
   throw lastErr;
 }
+const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 // ─────────────────────────────────────────────────────────────
-// STEP 1: Get ASP session cookie
+// STEP 1 — GET session cookie from the form page
 // ─────────────────────────────────────────────────────────────
 async function getSessionCookie() {
-  console.log(`[session] GET ${FORM_URL} via ${PROXY_HOST}:${PROXY_PORT}`);
-  const result = await proxyRequest({ targetUrl: FORM_URL });
-  console.log(`[session] HTTP ${result.status} | cookies: ${JSON.stringify(result.cookies)} | body: ${result.body.length} chars`);
-  if (result.status === 407) throw new Error('Proxy auth failed (407). Update PROXY_USER/PROXY_PASS env vars.');
-  if (result.body.toLowerCase().includes('bad gateway')) throw new Error('Proxy bad gateway. Check PROXY_HOST/PROXY_PORT env vars.');
-  if (result.status !== 200) throw new Error(`Unexpected status ${result.status} from session GET`);
-  return { cookies: result.cookies, body: result.body, status: result.status };
+  console.log(`[session] GET ${FORM_URL}`);
+  const r = await proxyRequest({ targetUrl: FORM_URL });
+  console.log(`[session] ${r.status} | body:${r.body.length} | cookies:${JSON.stringify(r.cookies)}`);
+  if (r.status === 407)  throw new Error('Proxy auth failed (407) — update PROXY_USER/PROXY_PASS');
+  if (r.body.toLowerCase().includes('bad gateway')) throw new Error('Proxy bad gateway — update PROXY_HOST/PROXY_PORT');
+  if (r.status !== 200)  throw new Error(`Session GET returned ${r.status}`);
+  return { cookies: r.cookies, body: r.body };
 }
 
 // ─────────────────────────────────────────────────────────────
-// STEP 2: Submit search form
+// STEP 2 — POST search form
+//
+// The form on enter_name.shtm has:
+//   soid   = (empty for name search)
+//   name   = LASTNAME FIRSTNAME  (site says "Last name space first name")
+//   serial = (empty)
+//   B1     = Search
+//   qry    = Inquiry   ← the dropdown value we must set
+//
+// The site accepts the name as-is (space-separated, uppercase).
+// We do NOT convert to "LAST,FIRST" format — the site format is
+// "Last name (space) first name" as shown on the form.
 // ─────────────────────────────────────────────────────────────
-async function submitSearchForm(sessionCookies, searchName, soidVal) {
-  const nameParam = soidVal ? '' : encodeURIComponent(searchName).replace(/%20/g, '+');
-  const soidParam = soidVal ? encodeURIComponent(soidVal) : '';
-  const postBody  = `soid=${soidParam}&name=${nameParam}&serial=&B1=Search&qry=Inquiry`;
-  console.log(`[form] POST /inquiry.asp | ${postBody}`);
-  const result = await proxyRequest({
-    method: 'POST', targetUrl: BASE_URL + '/inquiry.asp',
-    postBody, cookies: sessionCookies,
-    extraHeaders: { 'Referer': FORM_URL, 'Origin': BASE_URL },
+async function submitSearch(sessionCookies, searchName, soidVal) {
+  // Build POST body matching the exact form fields
+  let postBody;
+  if (soidVal) {
+    postBody = `soid=${encodeURIComponent(soidVal)}&name=&serial=&B1=Search&qry=Inquiry`;
+  } else {
+    // Name format: "GARCIA ELVIA" → sent as-is, spaces encoded as +
+    postBody = `soid=&name=${encodeURIComponent(searchName).replace(/%20/g, '+')}&serial=&B1=Search&qry=Inquiry`;
+  }
+
+  console.log(`[search] POST /inquiry.asp  body=${postBody}`);
+  const r = await proxyRequest({
+    method:    'POST',
+    targetUrl: BASE_URL + '/inquiry.asp',
+    postBody,
+    cookies:   sessionCookies,
+    extraHeaders: {
+      'Referer': FORM_URL,
+      'Origin':  BASE_URL,
+      'Cache-Control': 'no-cache',
+    },
   });
-  console.log(`[form] ${result.status} | ${result.body.length} chars | loc: ${result.location || 'none'}`);
-  return { ...result, cookies: [...sessionCookies, ...result.cookies] };
+  console.log(`[search] ${r.status} | body:${r.body.length} | loc:${r.location || 'none'}`);
+  return { ...r, cookies: [...sessionCookies, ...r.cookies] };
 }
 
 // ─────────────────────────────────────────────────────────────
-// GET any page via proxy
+// GET any page via proxy (for redirects + detail pages)
 // ─────────────────────────────────────────────────────────────
 async function getPage(url, cookies, referer) {
-  const result = await proxyRequest({ targetUrl: url, cookies, extraHeaders: referer ? { 'Referer': referer } : {} });
-  console.log(`[http] GET ${url} → ${result.status} | ${result.body.length} chars`);
-  return { ...result, cookies: [...cookies, ...result.cookies] };
+  const r = await proxyRequest({
+    targetUrl:    url,
+    cookies,
+    extraHeaders: referer ? { 'Referer': referer } : {},
+  });
+  console.log(`[get] ${url} → ${r.status} | ${r.body.length} chars`);
+  return { ...r, cookies: [...cookies, ...r.cookies] };
 }
 
 // ─────────────────────────────────────────────────────────────
-// Parse HTML offline with Playwright (no network calls)
+// Parse HTML offline (Playwright setContent — no network)
 // ─────────────────────────────────────────────────────────────
 async function parseHtml(browser, html) {
-  const context = await browser.newContext();
-  const page    = await context.newPage();
+  const ctx  = await browser.newContext();
+  const page = await ctx.newPage();
   await page.setContent(html, { waitUntil: 'domcontentloaded' });
-  return { page, context };
+  return { page, ctx };
 }
 
 async function launchBrowser() {
   return chromium.launch({
     headless: true,
-    args: ['--no-sandbox','--disable-setuid-sandbox','--disable-dev-shm-usage','--disable-gpu','--no-first-run','--no-zygote','--single-process'],
+    args: ['--no-sandbox','--disable-setuid-sandbox','--disable-dev-shm-usage',
+           '--disable-gpu','--no-first-run','--no-zygote','--single-process'],
   });
 }
 
+// ─────────────────────────────────────────────────────────────
+// Format name for search
+// Input:  "Garcia, Elvia Yadira"  or  "GARCIA ELVIA"
+// Output: "GARCIA ELVIA"   (LASTNAME FIRSTNAME, space-separated, uppercase)
+//
+// The site format shown on form: "Last name (space) first name"
+// ─────────────────────────────────────────────────────────────
 function formatName(raw) {
   if (!raw) return '';
-  raw = raw.trim();
+  raw = raw.trim().toUpperCase();
+
   if (raw.includes(',')) {
-    const parts = raw.split(',');
-    return (parts[0].trim() + ' ' + parts[1].trim().split(' ')[0]).toUpperCase();
+    // "GARCIA, ELVIA YADIRA" → "GARCIA ELVIA"
+    const [last, rest] = raw.split(',');
+    const first = (rest || '').trim().split(/\s+/)[0];
+    return `${last.trim()} ${first}`.trim();
   }
-  return raw.toUpperCase();
+  // Already in "GARCIA ELVIA" format — return as-is
+  return raw;
+}
+
+// ─────────────────────────────────────────────────────────────
+// PARSE RESULTS PAGE
+// Extracts all rows from the results table.
+// Each row has: Name, DOB, Race, Sex, Location, SOID,
+//               Days in Custody, Last Known Booking button.
+//
+// The "Last Known Booking" button is a form submit with hidden
+// inputs: SOID and BOOKING_ID  →  posts to /InmDetails.asp
+// ─────────────────────────────────────────────────────────────
+async function parseResultsPage(page) {
+  return page.evaluate(() => {
+    const results = [];
+
+    // Find every data row in the results table
+    // Header row has th elements; data rows have td elements
+    const rows = Array.from(document.querySelectorAll('table tr'));
+
+    for (const row of rows) {
+      const cells = Array.from(row.querySelectorAll('td'));
+      if (cells.length < 6) continue;
+
+      // Skip header-like rows
+      const nameCell = (cells[1]?.innerText || '').trim();
+      if (!nameCell || nameCell.length < 2) continue;
+      if (nameCell.toLowerCase() === 'name') continue;
+      if (nameCell.toLowerCase().includes('image')) continue;
+
+      // Extract the SOID and BOOKING_ID from the "Last Known Booking" form
+      // The form is inside one of the cells (usually cell index 7 or 8)
+      let bookingId = '';
+      let soidFromForm = '';
+      let detailUrl = '';
+
+      // Search all forms in the row
+      for (const form of row.querySelectorAll('form')) {
+        const inputs = {};
+        form.querySelectorAll('input[type="hidden"], input[type="submit"], input').forEach(inp => {
+          inputs[(inp.name || '').toUpperCase()] = inp.value || '';
+        });
+        if (inputs['BOOKING_ID']) {
+          bookingId    = inputs['BOOKING_ID'];
+          soidFromForm = inputs['SOID'] || '';
+        }
+        // Also check form action for InmDetails
+        const action = (form.getAttribute('action') || '').toLowerCase();
+        if (action.includes('inmdetails') || action.includes('inm_details')) {
+          const params = new URLSearchParams(form.action.split('?')[1] || '');
+          if (!bookingId) bookingId = params.get('BOOKING_ID') || '';
+        }
+      }
+
+      // Also look for <a href> links to InmDetails
+      for (const a of row.querySelectorAll('a')) {
+        const href = a.href || a.getAttribute('href') || '';
+        if (href.toLowerCase().includes('inmdetails')) {
+          detailUrl = href;
+          // Extract from URL params if not already found
+          if (!bookingId) {
+            try {
+              const u = new URL(href, 'http://inmate-search.cobbsheriff.org');
+              bookingId    = u.searchParams.get('BOOKING_ID') || '';
+              soidFromForm = u.searchParams.get('soid') || soidFromForm;
+            } catch (e) {}
+          }
+        }
+      }
+
+      const soid = cells[6] ? (cells[6].innerText || '').trim() : '';
+
+      results.push({
+        name:            nameCell,
+        dob:             (cells[2]?.innerText || '').trim(),
+        race:            (cells[3]?.innerText || '').trim(),
+        sex:             (cells[4]?.innerText || '').trim(),
+        location:        (cells[5]?.innerText || '').trim(),
+        soid:            soid,
+        days_in_custody: (cells[7]?.innerText || '').trim(),
+        booking_id:      bookingId,
+        soid_from_form:  soidFromForm || soid,
+        detail_url:      detailUrl,
+      });
+    }
+
+    return results;
+  });
+}
+
+// ─────────────────────────────────────────────────────────────
+// PARSE DETAIL PAGE  (Arrest/Booking Report)
+//
+// Page sections (from screenshots):
+//  ┌─ Booking Information ──────────────────────────────────┐
+//  │ Agency ID | Arrest Date/Time | Booking Started | Booking Complete │
+//  ├─ Personal Information ─────────────────────────────────┤
+//  │ Name | DOB | Race/Sex | Location | SOID | Days in Custody │
+//  │ Height | Weight | Hair | Eyes                          │
+//  │ Address | City | State | Zip                           │
+//  │ Place of Birth                                         │
+//  ├─ Visible Scars and Marks ──────────────────────────────┤
+//  ├─ Arrest Circumstances ─────────────────────────────────┤
+//  │ Arrest Agency | Officer | Location of Arrest | Serial # │
+//  ├─ Charges ──────────────────────────────────────────────┤
+//  │ Warrant | [number] | Warrant Date | [date] | [count]  │
+//  │ Case | [number]    | OTN | [number]                    │
+//  │ Offense Date | Code Section | Description | Type | Counts | Bond │
+//  │ Disposition | [value]                                  │
+//  │ Bond Amount | [value]                                  │
+//  │ Bond Status | [value]                                  │
+//  ├─ Release Information ───────────────────────────────────┤
+//  │ Attorney | [name or "No Attorney of Record on file"]   │
+//  │ Release Date | Officer | Released To                   │
+//  │ Not Released  OR  [date]                               │
+//  └────────────────────────────────────────────────────────┘
+// ─────────────────────────────────────────────────────────────
+async function parseDetailPage(page) {
+  return page.evaluate(() => {
+    const bodyText = (document.body?.innerText || '').toLowerCase();
+
+    // Helper: find the value cell(s) after a header cell with given label
+    function cellAfter(label) {
+      const all = Array.from(document.querySelectorAll('td, th'));
+      for (let i = 0; i < all.length; i++) {
+        const t = (all[i].innerText || '').trim().toLowerCase();
+        if (t !== label.toLowerCase()) continue;
+        // Try next sibling TDs in same row
+        let sib = all[i].nextElementSibling;
+        while (sib) {
+          if (sib.tagName === 'TD' || sib.tagName === 'TH') {
+            const v = (sib.innerText || '').trim();
+            if (v && v.toLowerCase() !== label.toLowerCase()) return v;
+          }
+          sib = sib.nextElementSibling;
+        }
+        // Try first TD in next row
+        const tr = all[i].closest('tr');
+        if (tr?.nextElementSibling) {
+          const td = tr.nextElementSibling.querySelector('td');
+          if (td) return (td.innerText || '').trim();
+        }
+      }
+      return '';
+    }
+
+    // Helper: get all TDs in the row AFTER the row containing label
+    function rowAfter(label) {
+      const all = Array.from(document.querySelectorAll('td, th'));
+      for (let i = 0; i < all.length; i++) {
+        const t = (all[i].innerText || '').trim().toLowerCase();
+        if (t !== label.toLowerCase()) continue;
+        const tr = all[i].closest('tr');
+        if (tr?.nextElementSibling) {
+          return Array.from(tr.nextElementSibling.querySelectorAll('td, th'))
+            .map(c => (c.innerText || '').trim());
+        }
+      }
+      return [];
+    }
+
+    // ── Booking Information row ───────────────────────────────
+    const bookingRow = rowAfter('agency id');
+    // bookingRow: [AgencyID, ArrestDateTime, BookingStarted, BookingComplete]
+
+    // ── Personal Information rows ─────────────────────────────
+    const personalRow = rowAfter('name');
+    // personalRow: [Name, DOB, Race/Sex, Location, SOID, DaysInCustody]
+
+    const physicalRow = rowAfter('height');
+    // physicalRow: [Height, Weight, Hair, Eyes]
+
+    const addressRow = rowAfter('address');
+    // addressRow: [Address, City, State, Zip]
+
+    // ── Arrest Circumstances ──────────────────────────────────
+    const arrestRow = rowAfter('arrest agency');
+    // arrestRow: [ArrestAgency, Officer, LocationOfArrest, SerialNumber]
+
+    // ── Charges — parse each charge block ────────────────────
+    // Structure: Warrant row → Case row → header row → data rows → Disposition → Bond Amount → Bond Status
+    const charges = [];
+    const allRows = Array.from(document.querySelectorAll('tr'));
+    let inChargeSection = false;
+    let inChargeData    = false;
+    let currentCharge   = null;
+
+    // Header labels to skip
+    const skipLabels = new Set([
+      'offense date','code section','description','type','counts','bond',
+      'warrant','case','otn','disposition','bond amount','bond status',
+      'charges','n/a','',
+    ]);
+
+    for (let ri = 0; ri < allRows.length; ri++) {
+      const row   = allRows[ri];
+      const cells = Array.from(row.querySelectorAll('td, th')).map(c => (c.innerText || '').trim());
+      const text  = cells.join('|').toLowerCase();
+
+      // Enter charges section
+      if (!inChargeSection && text.includes('charges') && !text.includes('bond')) {
+        inChargeSection = true;
+        continue;
+      }
+
+      if (!inChargeSection) continue;
+
+      // Exit charges section at Release Information
+      if (text.includes('release information') || text.includes('attorney')) break;
+
+      // Warrant line: "Warrant | 24-WD-NA46 | Warrant Date | 2/13/2026 | 1"
+      if (text.includes('warrant') && !text.includes('case') && cells[0]?.toLowerCase() === 'warrant') {
+        if (currentCharge) charges.push(currentCharge);
+        currentCharge = {
+          warrant:       cells[1] || '',
+          warrant_date:  cells[3] || '',
+          warrant_count: cells[4] || '',
+          case_number:   '',
+          otn:           '',
+          offense_date:  '',
+          code_section:  '',
+          description:   '',
+          type:          '',
+          counts:        '',
+          bond:          '',
+          disposition:   '',
+          bond_amount:   '',
+          bond_status:   '',
+        };
+        inChargeData = false;
+        continue;
+      }
+
+      // Case line: "Case | 24CR02977-AGP | OTN | [value]"
+      if (cells[0]?.toLowerCase() === 'case' && currentCharge) {
+        currentCharge.case_number = cells[1] || '';
+        currentCharge.otn         = cells[3] || '';
+        continue;
+      }
+
+      // Column headers line: "Offense Date | Code Section | Description | Type | Counts | Bond"
+      if (text.includes('offense date') && text.includes('code section')) {
+        inChargeData = true;
+        continue;
+      }
+
+      // Charge data row
+      if (inChargeData && currentCharge && cells.length >= 3) {
+        const desc = cells[2] || '';
+        if (desc && !skipLabels.has(desc.toLowerCase()) && desc.toLowerCase() !== 'n/a') {
+          currentCharge.offense_date  = cells[0] || currentCharge.offense_date;
+          currentCharge.code_section  = cells[1] || currentCharge.code_section;
+          currentCharge.description   = desc;
+          currentCharge.type          = cells[3] || '';
+          currentCharge.counts        = cells[4] || '';
+          currentCharge.bond          = cells[5] || '';
+          inChargeData = false; // one charge row per block typically
+        }
+        continue;
+      }
+
+      // Disposition line
+      if (cells[0]?.toLowerCase() === 'disposition' && currentCharge) {
+        currentCharge.disposition = cells[1] || '';
+        continue;
+      }
+
+      // Bond Amount line
+      if (text.includes('bond amount') && currentCharge) {
+        // "Bond Amount | $0.00"  — the amount is typically the last non-empty cell
+        const amount = cells.filter(c => c && c !== 'Bond Amount').pop() || '';
+        currentCharge.bond_amount = amount;
+        continue;
+      }
+
+      // Bond Status line: "  | Bond Status | Sentenced/NO BOND |  | $0.00"
+      if (text.includes('bond status') && currentCharge) {
+        const idx = cells.findIndex(c => c.toLowerCase() === 'bond status');
+        currentCharge.bond_status = cells[idx + 1] || '';
+        continue;
+      }
+    }
+    if (currentCharge) charges.push(currentCharge);
+
+    // ── Release Information ───────────────────────────────────
+    const releaseRow = rowAfter('release date');
+    // Check "Not Released" text
+    const isReleased = bodyText.includes('not released') ? false : true;
+
+    // ── Height formatting: "508" → "5'08"" ───────────────────
+    let height = physicalRow[0] || '';
+    if (/^\d{3,4}$/.test(height)) {
+      const h = height.padStart(3, '0');
+      height  = `${h[0]}'${h.slice(1)}"`;
+    }
+
+    // ── Race/Sex split: "B /M" → race="B", sex="M" ───────────
+    const raceSex = (personalRow[2] || '').replace(/\s/g, '');
+    const [raceCode, sexCode] = raceSex.split('/');
+
+    return {
+      // Booking
+      agency_id:        bookingRow[0] || '',
+      arrest_date_time: bookingRow[1] || '',
+      booking_started:  bookingRow[2] || '',
+      booking_complete: bookingRow[3] || '',
+      // Personal
+      full_name:        personalRow[0] || '',
+      dob:              personalRow[1] || '',
+      race_code:        raceCode || '',
+      sex_code:         sexCode  || '',
+      location:         personalRow[3] || '',
+      soid:             personalRow[4] || '',
+      days_in_custody:  personalRow[5] || '',
+      // Physical
+      height,
+      weight:           physicalRow[1] || '',
+      hair:             physicalRow[2] || '',
+      eyes:             physicalRow[3] || '',
+      // Address
+      address:          addressRow[0] || '',
+      city:             addressRow[1] || '',
+      state:            addressRow[2] || '',
+      zip:              addressRow[3] || '',
+      place_of_birth:   cellAfter('place of birth'),
+      // Arrest
+      arresting_agency: arrestRow[0] || '',
+      arrest_officer:   arrestRow[1] || '',
+      location_of_arrest: arrestRow[2] || '',
+      serial_number:    arrestRow[3] || '',
+      // Charges array
+      charges,
+      // Release
+      release_date:     releaseRow[0] || '',
+      release_officer:  releaseRow[1] || '',
+      released_to:      releaseRow[2] || '',
+      is_released:      isReleased && !bodyText.includes('not released'),
+      attorney:         bodyText.includes('no attorney of record') ? '' : cellAfter('attorney'),
+    };
+  });
+}
+
+// ─────────────────────────────────────────────────────────────
+// BUILD final record (normalise codes → full words)
+// ─────────────────────────────────────────────────────────────
+const RACE_MAP = { B:'Black', W:'White', H:'Hispanic', A:'Asian', O:'Other', I:'Indigenous', U:'Unknown' };
+
+function buildRecord(detail, summaryRow, originalName) {
+  const race = RACE_MAP[detail.race_code] || detail.race_code || RACE_MAP[summaryRow.race] || summaryRow.race || '';
+  const sex  = detail.sex_code === 'M' ? 'Male' : detail.sex_code === 'F' ? 'Female' : detail.sex_code || summaryRow.sex || '';
+
+  const chargesDesc = detail.charges.map(c => c.description).filter(Boolean).join('; ');
+  const chargeType  = [...new Set(detail.charges.map(c => {
+    const t = (c.type || '').toLowerCase();
+    if (t.includes('felony'))     return 'Felony';
+    if (t.includes('misdemeanor')) return 'Misdemeanor';
+    return c.type;
+  }).filter(Boolean))].join('; ');
+
+  const rawSoid = (detail.soid || summaryRow.soid || '').trim();
+  const eventId = rawSoid ? String(parseInt(rawSoid.replace(/\D/g, ''), 10)) : '';
+
+  // Bond info from first charge
+  const firstCharge = detail.charges[0] || {};
+
+  return {
+    event_id:           eventId,
+    full_name:          detail.full_name || summaryRow.name || '',
+    original_name:      originalName || '',
+    county:             'Cobb',
+
+    // Booking
+    agency_id:          detail.agency_id,
+    arrest_date_time:   detail.arrest_date_time,
+    booking_date:       detail.booking_started,
+    end_of_booking_date: detail.booking_complete,
+    booking_number:     detail.serial_number,
+
+    // Demographics
+    date_of_birth:      detail.dob || summaryRow.dob || '',
+    race,
+    sex,
+    height:             detail.height,
+    weight:             detail.weight,
+    hair:               detail.hair,
+    eyes:               detail.eyes,
+
+    // Address
+    address:            [detail.address, detail.city, detail.state, detail.zip].filter(Boolean).join(', '),
+    place_of_birth:     detail.place_of_birth,
+
+    // Custody
+    custody_status:     detail.location || summaryRow.location || '',
+    is_released:        detail.is_released,
+    days_in_custody:    detail.days_in_custody || summaryRow.days_in_custody || '',
+    release_date:       detail.release_date,
+    release_officer:    detail.release_officer,
+    released_to:        detail.released_to,
+
+    // Arrest
+    arresting_agency:   detail.arresting_agency,
+    arrest_officer:     detail.arrest_officer,
+    location_of_arrest: detail.location_of_arrest,
+
+    // Charges
+    charges:            chargesDesc,
+    charge_type:        chargeType,
+    charges_detail:     detail.charges,
+
+    // Bond (from first charge block)
+    bonding_amount:     firstCharge.bond_amount || '',
+    bond_status:        firstCharge.bond_status || '',
+    bonding_company:    '',   // not on page
+    bondsman_name:      '',   // not on page
+
+    // Legal
+    warrant:            firstCharge.warrant || '',
+    case_number:        firstCharge.case_number || '',
+    otn:                firstCharge.otn || '',
+    disposition:        firstCharge.disposition || '',
+    attorney:           detail.attorney,
+
+    processed:          false,
+    locked:             false,
+    scraped_at:         new Date().toISOString(),
+  };
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -151,319 +622,201 @@ function formatName(raw) {
 // ─────────────────────────────────────────────────────────────
 app.get('/health', async (req, res) => {
   try {
-    const result = await getSessionCookie();
-    res.json({ status: 'ok', proxy: `${PROXY_HOST}:${PROXY_PORT}`, site_reachable: result.status === 200, cookies: result.cookies.length, timestamp: new Date().toISOString() });
+    const r = await getSessionCookie();
+    res.json({ status: 'ok', proxy: `${PROXY_HOST}:${PROXY_PORT}`, site_reachable: true, cookies: r.cookies.length, timestamp: new Date().toISOString() });
   } catch (err) {
-    res.json({ status: 'degraded', error: err.message, proxy: `${PROXY_HOST}:${PROXY_PORT}`, hint: 'Update PROXY_HOST/PROXY_PORT/PROXY_USER/PROXY_PASS env vars in Railway', timestamp: new Date().toISOString() });
+    res.json({ status: 'degraded', error: err.message, proxy: `${PROXY_HOST}:${PROXY_PORT}`, hint: 'Update PROXY_HOST/PROXY_PORT/PROXY_USER/PROXY_PASS in Railway Variables', timestamp: new Date().toISOString() });
   }
 });
 
 // ─────────────────────────────────────────────────────────────
-// /proxy-test — raw diagnostic endpoint
-// Hit this first when things break to check proxy health
+// /proxy-test — raw diagnostic, call this first when broken
 // ─────────────────────────────────────────────────────────────
 app.get('/proxy-test', async (req, res) => {
-  const start = Date.now();
+  const t = Date.now();
   try {
-    const result = await proxyRequest({ targetUrl: FORM_URL });
-    res.json({
-      proxy: `${PROXY_HOST}:${PROXY_PORT}`,
-      http_status: result.status,
-      body_length: result.body.length,
-      cookies: result.cookies,
-      duration_ms: Date.now() - start,
-      proxy_error: result.body.toLowerCase().includes('bad gateway'),
-      ok: result.status === 200,
-    });
+    const r = await proxyRequest({ targetUrl: FORM_URL });
+    res.json({ ok: r.status === 200, proxy: `${PROXY_HOST}:${PROXY_PORT}`, http_status: r.status, body_length: r.body.length, cookies: r.cookies, ms: Date.now() - t });
   } catch (err) {
-    res.json({
-      proxy: `${PROXY_HOST}:${PROXY_PORT}`,
-      error: err.message,
-      duration_ms: Date.now() - start,
-      ok: false,
-      hint: '"socket hang up" = proxy unreachable (dead IP or wrong port). "407" = bad credentials. Fix env vars in Railway.',
-    });
+    res.json({ ok: false, proxy: `${PROXY_HOST}:${PROXY_PORT}`, error: err.message, ms: Date.now() - t,
+      hint: '"socket hang up" = proxy IP dead. "407" = wrong credentials. Fix env vars in Railway.' });
   }
 });
 
 // ─────────────────────────────────────────────────────────────
-// /scrape  POST { name: "GARCIA ELVIA" } or { soid: "123456" }
+// /scrape  POST { name: "Garcia, Elvia Yadira" }
+//       or POST { name: "GARCIA ELVIA" }
+//       or POST { soid: "001115049" }
 // ─────────────────────────────────────────────────────────────
 app.post('/scrape', async (req, res) => {
   const { name, soid } = req.body;
   if (!name && !soid) return res.status(400).json({ success: false, error: 'Provide name or soid' });
 
   const searchName = name ? formatName(name) : '';
-  console.log(`[scrape] "${name || soid}" → "${searchName}"`);
+  console.log(`\n[scrape] ── START "${name || soid}" → search:"${searchName}" ──`);
 
   let browser;
   try {
     browser = await launchBrowser();
 
-    console.log('[scrape] Step 1 — getting session cookie');
+    // ── Step 1: Session cookie ────────────────────────────────
+    console.log('[scrape] Step 1 — session cookie');
     const session = await withRetry(() => getSessionCookie(), 3, 3000);
     let cookies = session.cookies;
-    console.log(`[scrape] Cookies: ${JSON.stringify(cookies.map(c => c.split(';')[0]))}`);
 
-    console.log('[scrape] Step 2 — submitting search form');
-    const formResult = await withRetry(() => submitSearchForm(cookies, searchName, soid), 2, 2000);
-    cookies = formResult.cookies;
+    // ── Step 2: Submit search form ────────────────────────────
+    console.log('[scrape] Step 2 — submit search (qry=Inquiry)');
+    const searchResult = await withRetry(() => submitSearch(cookies, searchName, soid), 2, 2000);
+    cookies = searchResult.cookies;
 
-    let resultsHtml = formResult.body;
-    if (formResult.status === 302 || formResult.status === 301) {
-      const loc = formResult.location || '';
-      const redirectUrl = loc.startsWith('http') ? loc : BASE_URL + loc;
-      console.log(`[scrape] Redirect → ${redirectUrl}`);
-      const redir = await getPage(redirectUrl, cookies, BASE_URL + '/inquiry.asp');
+    // Follow redirect if server sends one
+    let resultsHtml = searchResult.body;
+    if (searchResult.status === 301 || searchResult.status === 302) {
+      const loc = searchResult.location || '';
+      const dest = loc.startsWith('http') ? loc : BASE_URL + loc;
+      console.log(`[scrape] redirect → ${dest}`);
+      const redir = await getPage(dest, cookies, BASE_URL + '/inquiry.asp');
       resultsHtml = redir.body;
-      cookies = redir.cookies;
+      cookies     = redir.cookies;
     }
-    console.log(`[scrape] Results HTML: ${resultsHtml.length} chars`);
+    console.log(`[scrape] results HTML: ${resultsHtml.length} chars`);
 
-    const { page: rPage, context: rCtx } = await parseHtml(browser, resultsHtml);
-    const bodyText = await rPage.textContent('body').catch(() => '');
+    // ── Step 3: Parse results page ────────────────────────────
+    console.log('[scrape] Step 3 — parse results');
+    const { page: rPage, ctx: rCtx } = await parseHtml(browser, resultsHtml);
+
+    const bodyText = (await rPage.textContent('body').catch(() => '')).toLowerCase();
     const hasTable = (await rPage.$('table')) !== null;
 
-    if (!hasTable || bodyText.toLowerCase().includes('no record') || bodyText.toLowerCase().includes('no match') || bodyText.toLowerCase().includes('not found')) {
+    if (!hasTable || bodyText.includes('no record') || bodyText.includes('no match') || bodyText.includes('not found')) {
       await rCtx.close(); await browser.close();
-      console.log(`[scrape] No results for: ${searchName || soid}`);
+      console.log('[scrape] No results found');
       return res.json({ success: true, found: false, name: name || soid, data: null });
     }
 
-    const summaryRow = await rPage.evaluate(() => {
-      for (const row of document.querySelectorAll('table tr')) {
-        const cells = Array.from(row.querySelectorAll('td')).map(td => (td.innerText || '').trim());
-        if (cells.length >= 6 && cells[1] && cells[1].length > 2 && !cells[1].toLowerCase().includes('name') && !cells[1].toLowerCase().includes('image')) {
-          return { name: cells[1]||'', dob: cells[2]||'', race: cells[3]||'', sex: cells[4]||'', location: cells[5]||'', soid: cells[6]||'', days_in_custody: cells[7]||'' };
-        }
-      }
-      return null;
-    });
-
-    if (!summaryRow) {
-      await rCtx.close(); await browser.close();
-      return res.json({ success: true, found: false, name: name || soid, data: null });
-    }
-    console.log(`[scrape] Found: "${summaryRow.name}" SOID:${summaryRow.soid}`);
-
-    const bookingInfo = await rPage.evaluate(() => {
-      for (const form of document.querySelectorAll('form')) {
-        const action = (form.action || form.getAttribute('action') || '').toLowerCase();
-        if (!action.includes('inmdetails') && !action.includes('inm_details')) continue;
-        const inputs = {};
-        form.querySelectorAll('input').forEach(i => { inputs[(i.name||'').toUpperCase()] = i.value; });
-        if (inputs['BOOKING_ID']) return { soid: inputs['SOID']||'', bookingId: inputs['BOOKING_ID'] };
-      }
-      const all = {};
-      document.querySelectorAll('input').forEach(i => { all[(i.name||'').toUpperCase()] = i.value; });
-      if (all['BOOKING_ID']) return { soid: all['SOID']||'', bookingId: all['BOOKING_ID'] };
-      for (const a of document.querySelectorAll('a')) {
-        const href = a.href || a.getAttribute('href') || '';
-        if (href.toLowerCase().includes('inmdetails')) return { href };
-      }
-      return null;
-    });
-
+    const rows = await parseResultsPage(rPage);
     await rCtx.close();
-    console.log(`[scrape] bookingInfo: ${JSON.stringify(bookingInfo)}`);
+    console.log(`[scrape] Found ${rows.length} result row(s): ${JSON.stringify(rows.map(r => r.name))}`);
 
-    if (!bookingInfo || (!bookingInfo.bookingId && !bookingInfo.href)) {
+    if (!rows.length) {
+      await browser.close();
+      return res.json({ success: true, found: false, name: name || soid, data: null });
+    }
+
+    // Use the first matching row
+    const summaryRow = rows[0];
+    console.log(`[scrape] Using: "${summaryRow.name}" SOID:${summaryRow.soid} BookingID:${summaryRow.booking_id}`);
+
+    // If no BOOKING_ID found, return summary only
+    if (!summaryRow.booking_id && !summaryRow.detail_url) {
       console.log('[scrape] No BOOKING_ID — returning summary only');
       await browser.close();
-      return res.json({ success: true, found: true, data: buildBasicData(summaryRow, name||soid) });
+      return res.json({ success: true, found: true, detail: false, data: buildSummaryRecord(summaryRow, name || soid) });
     }
 
+    // ── Step 4: Fetch detail page ─────────────────────────────
     let detailUrl;
-    if (bookingInfo.href) {
-      detailUrl = bookingInfo.href.startsWith('http') ? bookingInfo.href : BASE_URL + '/' + bookingInfo.href.replace(/^\//, '');
+    if (summaryRow.detail_url) {
+      detailUrl = summaryRow.detail_url.startsWith('http')
+        ? summaryRow.detail_url
+        : BASE_URL + '/' + summaryRow.detail_url.replace(/^\//, '');
     } else {
-      const ds = (bookingInfo.soid || summaryRow.soid || '').trim();
-      detailUrl = `${BASE_URL}/InmDetails.asp?soid=${encodeURIComponent(ds)}&BOOKING_ID=${encodeURIComponent(bookingInfo.bookingId)}`;
+      const s = encodeURIComponent((summaryRow.soid_from_form || summaryRow.soid || '').trim());
+      const b = encodeURIComponent(summaryRow.booking_id);
+      detailUrl = `${BASE_URL}/InmDetails.asp?soid=${s}&BOOKING_ID=${b}`;
     }
-    console.log(`[scrape] Step 4 — ${detailUrl}`);
+
+    console.log(`[scrape] Step 4 — detail: ${detailUrl}`);
     const detailResult = await getPage(detailUrl, cookies, BASE_URL + '/inquiry.asp');
 
-    if (detailResult.body.includes('Error_Page') || detailResult.body.includes('Unauthorised')) {
-      console.log('[scrape] Error page on detail — summary only');
+    if (!detailResult.body || detailResult.body.includes('Error_Page') || detailResult.body.includes('Unauthorised')) {
+      console.log('[scrape] Detail page error — summary only');
       await browser.close();
-      return res.json({ success: true, found: true, data: buildBasicData(summaryRow, name||soid) });
+      return res.json({ success: true, found: true, detail: false, data: buildSummaryRecord(summaryRow, name || soid) });
     }
 
-    const { page: dPage, context: dCtx } = await parseHtml(browser, detailResult.body);
+    // ── Step 5: Parse detail page ─────────────────────────────
+    console.log('[scrape] Step 5 — parse detail page');
+    const { page: dPage, ctx: dCtx } = await parseHtml(browser, detailResult.body);
     const detail = await parseDetailPage(dPage);
     await dCtx.close();
     await browser.close();
 
-    console.log(`[scrape] ✅ ${detail.full_name || summaryRow.name} | booking:${detail.booking_started} | charges:${detail.charges_description.substring(0,60)}`);
-    return res.json({ success: true, found: true, detail_url: detailUrl, scraped_at: new Date().toISOString(), data: buildRecord(detail, summaryRow, name||soid) });
+    const record = buildRecord(detail, summaryRow, name || soid);
+    console.log(`[scrape] ✅ ${record.full_name} | booking:${record.booking_date} | charges:${record.charges.substring(0, 80)}`);
+
+    return res.json({
+      success:    true,
+      found:      true,
+      detail:     true,
+      detail_url: detailUrl,
+      scraped_at: new Date().toISOString(),
+      data:       record,
+    });
 
   } catch (err) {
     if (browser) await browser.close().catch(() => {});
-    console.error(`[scrape] ❌ "${name||soid}": ${err.message}`);
+    console.error(`[scrape] ❌ "${name || soid}": ${err.message}`);
     return res.status(500).json({
-      success: false, found: false, error: err.message, name: name||soid||'',
-      hint: (err.message.includes('timed out') || err.message.includes('socket hang up'))
-        ? 'Proxy is unreachable. Go to Railway → Variables and update PROXY_HOST/PROXY_PORT/PROXY_USER/PROXY_PASS with a working proxy.'
+      success: false,
+      found:   false,
+      error:   err.message,
+      name:    name || soid || '',
+      hint:    (err.message.includes('timed out') || err.message.includes('socket hang up'))
+        ? 'Proxy is dead. Update PROXY_HOST/PROXY_PORT/PROXY_USER/PROXY_PASS in Railway Variables.'
         : undefined,
     });
   }
 });
 
-// ─────────────────────────────────────────────────────────────
-// PARSE DETAIL PAGE
-// ─────────────────────────────────────────────────────────────
-async function parseDetailPage(page) {
-  return page.evaluate(() => {
-    const bodyText = document.body.innerText || '';
-    function val(label) {
-      const all = Array.from(document.querySelectorAll('td, th'));
-      for (let i = 0; i < all.length; i++) {
-        if ((all[i].innerText||'').trim().toLowerCase() !== label.toLowerCase()) continue;
-        let sib = all[i].nextElementSibling;
-        while (sib) {
-          if (sib.tagName==='TD'||sib.tagName==='TH') { const v=(sib.innerText||'').trim(); if(v) return v; }
-          sib = sib.nextElementSibling;
-        }
-        const tr = all[i].closest('tr');
-        if (tr && tr.nextElementSibling) { const td = tr.nextElementSibling.querySelector('td, th'); if (td) return (td.innerText||'').trim(); }
-      }
-      return '';
-    }
-    function rowAfter(label) {
-      const all = Array.from(document.querySelectorAll('td, th'));
-      for (let i = 0; i < all.length; i++) {
-        if ((all[i].innerText||'').trim().toLowerCase() !== label.toLowerCase()) continue;
-        const tr = all[i].closest('tr');
-        if (tr && tr.nextElementSibling) return Array.from(tr.nextElementSibling.querySelectorAll('td, th')).map(td => (td.innerText||'').trim());
-      }
-      return [];
-    }
-    const bRow=rowAfter('agency id'), pRow=rowAfter('name'), hRow=rowAfter('height');
-    const aRow=rowAfter('address'), arRow=rowAfter('arrest agency');
-    const bsRow=rowAfter('bond status'), bmanRow=rowAfter('case/warrant'), relRow=rowAfter('release date');
-    let height=hRow[0]||'';
-    if(/^\d{3,4}$/.test(height)){const h=height.padStart(3,'0');height=h[0]+"'"+h.slice(1)+'"';}
-    const location=pRow[3]||'';
-    const charges=[];let inCharges=false;
-    const skipList=['offense date','description','type','warrant','case','disposition','counts','bond','n/a',''];
-    for(const tr of document.querySelectorAll('tr')){
-      const cells=Array.from(tr.querySelectorAll('td,th')).map(c=>(c.innerText||'').trim());
-      const rt=cells.join('|').toLowerCase();
-      if(!inCharges&&rt.includes('offense date')&&rt.includes('code section')){inCharges=true;continue;}
-      if(inCharges){
-        if(rt.includes('bond amount')||rt.includes('release information')||rt.includes('release date')||rt.includes('attorney'))break;
-        const desc=cells[2]||'';
-        if(desc&&desc.length>2&&!skipList.includes(desc.toLowerCase()))
-          charges.push({offense_date:cells[0]||'',code_section:cells[1]||'',description:desc,type:cells[3]||'',counts:cells[4]||'',bond:cells[5]||''});
-      }
-    }
-    return {
-      agency_id:bRow[0]||'', arrest_date_time:bRow[1]||'', booking_started:bRow[2]||'', booking_complete:bRow[3]||'',
-      full_name:pRow[0]||'', dob:pRow[1]||'', race_sex:pRow[2]||'', location, soid:pRow[4]||'', days_in_custody:pRow[5]||'',
-      height, weight:hRow[1]||'', hair:hRow[2]||'', eyes:hRow[3]||'',
-      address:[aRow[0]||'',aRow[1]||'',aRow[2]||'',aRow[3]||''].filter(Boolean).join(', '),
-      place_of_birth:val('place of birth'),
-      arresting_agency:arRow[0]||'', arrest_officer:arRow[1]||'', location_of_arrest:arRow[2]||'', serial_number:arRow[3]||'',
-      warrant:val('warrant'), case_number:val('case'), otn:val('otn'),
-      charges, charges_description:charges.map(c=>c.description).join('; '),
-      charge_type:[...new Set(charges.map(c=>{
-        if((c.type||'').toLowerCase().includes('felony'))return'Felony';
-        if((c.type||'').toLowerCase().includes('misdemeanor'))return'Misdemeanor';
-        return c.type;
-      }).filter(Boolean))].join('; '),
-      disposition:val('disposition'),
-      bonding_amount:val('bond amount'), bond_status:bsRow[1]||val('bond status'), bonding_company:bsRow[2]||'',
-      case_warrant:bmanRow[0]||'', bondsman_name:bmanRow[1]||'',
-      attorney:bodyText.includes('No Attorney of Record')?'':val('attorney'),
-      release_date:relRow[0]||'', release_officer:relRow[1]||'', released_to:relRow[2]||'',
-      is_released:!bodyText.includes('Not Released')&&!location.toLowerCase().includes('jail'),
-    };
-  });
-}
-
-function buildRecord(detail, summaryRow, originalName) {
-  const rsp=(detail.race_sex||'').replace(/\s/g,'').split('/');
-  const raceMap={B:'Black',W:'White',H:'Hispanic',A:'Asian',O:'Other',I:'Indigenous',U:'Unknown'};
-  const race=raceMap[rsp[0]]||rsp[0]||summaryRow.race||'';
-  const sexRaw=rsp[1]||summaryRow.sex||'';
-  const sex=sexRaw==='M'?'Male':sexRaw==='F'?'Female':sexRaw;
-  const rawSoid=(detail.soid||summaryRow.soid||'').trim();
-  const eventId=rawSoid?String(parseInt(rawSoid.replace(/\D/g,''),10)):'';
+// Summary-only record (when detail page unavailable)
+function buildSummaryRecord(row, originalName) {
+  const rawSoid = (row.soid || '').trim();
+  const eventId = rawSoid ? String(parseInt(rawSoid.replace(/\D/g, ''), 10)) : '';
+  const race    = RACE_MAP[(row.race || '').trim()] || row.race || '';
+  const sex     = row.sex === 'M' ? 'Male' : row.sex === 'F' ? 'Female' : row.sex || '';
   return {
-    event_id:eventId, full_name:detail.full_name||summaryRow.name||'', original_name:originalName||'',
-    charges:detail.charges_description||'', charge_type:detail.charge_type||'', county:'Cobb',
-    custody_status:detail.location||summaryRow.location||'', is_released:detail.is_released,
-    bonding_amount:detail.bonding_amount||'', bonding_company:detail.bonding_company||'',
-    booking_date:detail.booking_started||'', end_of_booking_date:detail.booking_complete||'',
-    booking_number:detail.serial_number||'', address:detail.address||'',
-    arresting_agency:detail.arresting_agency||'', arrest_officer:detail.arrest_officer||'',
-    days_in_custody:detail.days_in_custody||summaryRow.days_in_custody||'',
-    place_of_birth:detail.place_of_birth||'', date_of_birth:detail.dob||summaryRow.dob||'',
-    attorney:detail.attorney||'', bondsman_name:detail.bondsman_name||'',
-    case_warrant:detail.case_warrant||'', bond_status:detail.bond_status||'',
-    race, sex, height:detail.height||'', weight:detail.weight||'', hair:detail.hair||'', eyes:detail.eyes||'',
-    processed:false, locked:false, scraped_at:new Date().toISOString(),
-    warrant:detail.warrant||'', case_number:detail.case_number||'', otn:detail.otn||'',
-    disposition:detail.disposition||'', arrest_date_time:detail.arrest_date_time||'',
-    agency_id:detail.agency_id||'', charges_detail:detail.charges||[],
-  };
-}
-
-function buildBasicData(summaryRow, originalName) {
-  const rawSoid=(summaryRow.soid||'').trim();
-  const eventId=rawSoid?String(parseInt(rawSoid.replace(/\D/g,''),10)):'';
-  const raceMap={B:'Black',W:'White',H:'Hispanic',A:'Asian',O:'Other',I:'Indigenous',U:'Unknown'};
-  const race=raceMap[(summaryRow.race||'').trim()]||summaryRow.race||'';
-  const sexRaw=(summaryRow.sex||'').trim();
-  const sex=sexRaw==='M'?'Male':sexRaw==='F'?'Female':sexRaw;
-  return {
-    event_id:eventId, full_name:summaryRow.name||'', original_name:originalName||'',
-    charges:'', charge_type:'', county:'Cobb', custody_status:summaryRow.location||'',
-    is_released:(summaryRow.location||'').toUpperCase()==='RELEASED',
-    bonding_amount:'', bonding_company:'', booking_date:'',
-    date_of_birth:summaryRow.dob||'', days_in_custody:summaryRow.days_in_custody||'',
-    race, sex, processed:false, locked:false, scraped_at:new Date().toISOString(),
+    event_id: eventId, full_name: row.name, original_name: originalName,
+    county: 'Cobb', date_of_birth: row.dob, race, sex,
+    custody_status: row.location, is_released: (row.location || '').toUpperCase() === 'RELEASED',
+    days_in_custody: row.days_in_custody,
+    charges: '', charge_type: '', bonding_amount: '', bond_status: '',
+    processed: false, locked: false, scraped_at: new Date().toISOString(),
   };
 }
 
 // ─────────────────────────────────────────────────────────────
-// /admissions
+// /admissions  GET — list today's admissions
 // ─────────────────────────────────────────────────────────────
 app.post('/admissions', async (req, res) => {
   let browser;
   try {
     const session = await withRetry(() => getSessionCookie(), 3, 3000);
-    const result  = await getPage(BASE_URL + '/inquiry.asp?soid=&inmate_name=&serial=&qry=Admissions', session.cookies, FORM_URL);
+    const result  = await getPage(
+      BASE_URL + '/inquiry.asp?soid=&inmate_name=&serial=&qry=Admissions',
+      session.cookies, FORM_URL
+    );
     browser = await launchBrowser();
-    const { page, context } = await parseHtml(browser, result.body);
+    const { page, ctx } = await parseHtml(browser, result.body);
     await page.waitForSelector('table', { timeout: 10000 }).catch(() => {});
     const inmates = await page.evaluate(() =>
       Array.from(document.querySelectorAll('table tr')).slice(1).map(row => {
-        const cells = Array.from(row.querySelectorAll('td')).map(c => (c.innerText||'').trim());
-        if (!cells[1]||cells[1].length<2) return null;
-        return { name:cells[1]||'', dob:cells[2]||'', race:cells[3]||'', sex:cells[4]||'', location:cells[5]||'', soid:cells[6]||'', days_in_custody:cells[7]||'' };
+        const c = Array.from(row.querySelectorAll('td')).map(td => (td.innerText || '').trim());
+        if (!c[1] || c[1].length < 2) return null;
+        return { name: c[1], dob: c[2], race: c[3], sex: c[4], location: c[5], soid: c[6], days_in_custody: c[7] };
       }).filter(Boolean)
     );
-    await context.close(); await browser.close();
-    res.json({ success:true, count:inmates.length, inmates });
+    await ctx.close(); await browser.close();
+    res.json({ success: true, count: inmates.length, inmates });
   } catch (err) {
     if (browser) await browser.close().catch(() => {});
-    res.status(500).json({ success:false, error:err.message });
+    res.status(500).json({ success: false, error: err.message });
   }
 });
 
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`✅ Cobb County Scraper on port ${PORT}`);
-  console.log(`   Proxy: ${PROXY_HOST}:${PROXY_PORT}`);
-  console.log(`   Endpoints: GET /health  GET /proxy-test  POST /scrape  POST /admissions`);
+  console.log(`   Proxy:  ${PROXY_HOST}:${PROXY_PORT}`);
+  console.log(`   Target: ${BASE_URL}`);
+  console.log(`   Routes: GET /health  GET /proxy-test  POST /scrape  POST /admissions`);
 });
-```
-
----
-
-That's everything. After pasting, **the most important step**: go to **Railway → your service → Variables** and add a working proxy:
-```
-PROXY_HOST = <new proxy ip>
-PROXY_PORT = <port>
-PROXY_USER = <username>
-PROXY_PASS = <password>
