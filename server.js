@@ -242,17 +242,60 @@ function parseRows(allRows, fullText, originalName) {
       currentCharge.bond_status = row[idx + 1] || '';
       continue;
     }
-    if (currentCharge && row[2] && row[2].length > 2 &&
-        !['description','type','n/a',''].includes(row[2].toLowerCase())) {
-      currentCharge.offense_date = row[0] || '';
-      currentCharge.code_section = row[1] || '';
-      currentCharge.description  = row[2] || '';
-      currentCharge.type         = row[3] || '';
-      currentCharge.counts       = row[4] || '';
-      currentCharge.bond         = row[5] || '';
+    // Fee rows to skip — these are court/bond fees, not actual charges
+    const FEE_KEYWORDS = [
+      'indigent defense', 'jail construction', 'poptf', 'peace officer',
+      'cobb county bond fee', 'staffing act', 'prosecutor training'
+    ];
+    const rowText = row.join(' ').toLowerCase();
+    const isFeeRow = FEE_KEYWORDS.some(k => rowText.includes(k));
+    if (isFeeRow) continue;
+
+    // Offense row: has a meaningful description (col 2 or col 1 if N/A in col 0)
+    // Pattern A: [offense_date, code_section, description, type, counts, bond]
+    // Pattern B: [N/A, code_section, description, type, counts, bond]  (N/A offense date)
+    if (currentCharge) {
+      // Find the description — it's the longest cell that looks like a charge
+      const isOffenseHeader = row.some(c => /^(offense date|code section|description|type|counts|bond)$/i.test(c.trim()));
+      if (isOffenseHeader) continue;
+
+      // Detect if col 0 is a date or 'N/A' (offense date column)
+      const col0 = (row[0] || '').trim();
+      const col1 = (row[1] || '').trim();
+      const col2 = (row[2] || '').trim();
+      const col3 = (row[3] || '').trim();
+      const col4 = (row[4] || '').trim();
+      const col5 = (row[5] || '').trim();
+
+      const isDateOrNA = /^(n\/a|\d{1,2}\/\d{1,2}\/\d{4})$/i.test(col0);
+      const hasOCGA    = /^OCGA/i.test(col1);
+      const hasDesc    = col2.length > 4 &&
+                         !['description','type','counts','bond','disposition'].includes(col2.toLowerCase());
+
+      if (isDateOrNA && (hasOCGA || hasDesc)) {
+        currentCharge.offense_date = col0;
+        currentCharge.code_section = col1;
+        currentCharge.description  = col2;
+        currentCharge.type         = col3;
+        currentCharge.counts       = col4;
+        currentCharge.bond         = col5;
+      }
     }
   }
   if (currentCharge) charges.push(currentCharge);
+
+  // Find the actual total bond amount row (separate from per-charge bond)
+  // It appears as a standalone row with just "Bond Amount" label and a dollar value
+  let totalBondAmount = '';
+  for (let i = 0; i < allRows.length; i++) {
+    const row = allRows[i];
+    const joined = row.join('|');
+    if (/bond amount/i.test(joined)) {
+      // Find rightmost dollar-formatted cell
+      const dollarCell = [...row].reverse().find(c => /^\$[\d,]+\.\d{2}$/.test((c || '').trim()));
+      if (dollarCell) { totalBondAmount = dollarCell.trim(); break; }
+    }
+  }
 
   const relIdx     = allRows.findIndex(r => r.some(c => /^release date$/i.test(c.trim())));
   const releaseRow = relIdx >= 0 ? (allRows[relIdx + 1] || []) : [];
@@ -312,7 +355,7 @@ function parseRows(allRows, fullText, originalName) {
     charges:             chargesDesc,
     charge_type:         chargeType,
     charges_detail:      charges,
-    bonding_amount:      firstCharge.bond_amount || '',
+    bonding_amount:      totalBondAmount || firstCharge.bond_amount || '',
     bond_status:         firstCharge.bond_status || '',
     bonding_company:     '',
     bondsman_name:       '',
