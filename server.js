@@ -8,8 +8,8 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
 
-const PROXY_HOST = process.env.PROXY_HOST || '31.59.20.176';
-const PROXY_PORT = process.env.PROXY_PORT || '6754';
+const PROXY_HOST = process.env.PROXY_HOST || '107.172.163.27';
+const PROXY_PORT = process.env.PROXY_PORT || '6543';
 const PROXY_USER = process.env.PROXY_USER || 'bhkcvqwz';
 const PROXY_PASS = process.env.PROXY_PASS || '8o7dd3heu5b3';
 const PROXY_URL  = PROXY_HOST
