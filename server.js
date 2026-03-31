@@ -90,23 +90,13 @@ async function scrapeInmate(searchName, soidVal) {
     // Intercept window.open to capture detail URL
     let capturedUrl = await page.evaluate(() => {
       return new Promise((resolve) => {
-        window.open = (url) => {
-          resolve(url);
-          return null;
-        };
-
+        window.open = (url) => { resolve(url); return null; };
         const buttons = Array.from(document.querySelectorAll('input[type="submit"], button, input[type="button"]'));
         const bookingBtn = buttons.find(b =>
           /last/i.test(b.value || b.innerText || '') ||
           /booking/i.test(b.value || b.innerText || '')
         );
-
-        if (bookingBtn) {
-          bookingBtn.click();
-        } else {
-          resolve(null);
-        }
-
+        if (bookingBtn) { bookingBtn.click(); } else { resolve(null); }
         setTimeout(() => resolve(null), 4000);
       });
     });
@@ -137,22 +127,242 @@ async function scrapeInmate(searchName, soidVal) {
 
     console.log(`[scrape] Final URL: ${page.url()}`);
 
-    const allRows = await page.evaluate(() => {
-      const rows = [];
-      document.querySelectorAll('table').forEach(tbl => {
-        tbl.querySelectorAll('tr').forEach(tr => {
-          const cells = Array.from(tr.querySelectorAll('td, th'))
-            .map(td => (td.innerText || '').trim());
-          if (cells.some(c => c.length > 0)) rows.push(cells);
-        });
-      });
-      return rows;
+    // ── Parse using DOM directly for accuracy ─────────────────
+    const extracted = await page.evaluate(() => {
+
+      function cellText(el) { return (el?.innerText || '').trim(); }
+
+      function findRowAfter(labelText) {
+        const all = Array.from(document.querySelectorAll('tr'));
+        for (let i = 0; i < all.length; i++) {
+          const cells = Array.from(all[i].querySelectorAll('td,th')).map(c => cellText(c).toLowerCase());
+          if (cells.some(c => c === labelText.toLowerCase())) {
+            const next = all[i + 1];
+            if (next) return Array.from(next.querySelectorAll('td,th')).map(c => cellText(c));
+          }
+        }
+        return [];
+      }
+
+      function findCellAfter(labelText) {
+        const all = Array.from(document.querySelectorAll('td,th'));
+        for (let i = 0; i < all.length; i++) {
+          if (cellText(all[i]).toLowerCase() === labelText.toLowerCase()) {
+            for (let j = i + 1; j < all.length; j++) {
+              const v = cellText(all[j]);
+              if (v && v.toLowerCase() !== labelText.toLowerCase()) return v;
+            }
+          }
+        }
+        return '';
+      }
+
+      // ── Booking info ────────────────────────────────────────
+      const bookingRow  = findRowAfter('agency id');
+      const personalRow = findRowAfter('name');
+      const physicalRow = findRowAfter('height');
+      const addressRow  = findRowAfter('address');
+      const arrestRow   = findRowAfter('arrest agency');
+      const releaseRow  = findRowAfter('release date');
+
+      // ── Bondsman ────────────────────────────────────────────
+      const allRows = Array.from(document.querySelectorAll('tr'));
+      let caseWarrantVal = '';
+      let bondsmanName   = '';
+      for (const row of allRows) {
+        const cells = Array.from(row.querySelectorAll('td,th')).map(c => cellText(c));
+        const joined = cells.join('|').toLowerCase();
+        if (joined.includes('case/warrant') && joined.includes('bondsman')) {
+          const nextRow = row.nextElementSibling;
+          if (nextRow) {
+            const nc = Array.from(nextRow.querySelectorAll('td,th')).map(c => cellText(c));
+            caseWarrantVal = nc[0] || '';
+            bondsmanName   = nc[1] || '';
+          }
+          break;
+        }
+      }
+
+      // ── Bond status ─────────────────────────────────────────
+      let bondStatusVal = '';
+      for (const row of allRows) {
+        const cells = Array.from(row.querySelectorAll('td,th')).map(c => cellText(c));
+        const joined = cells.join('|').toLowerCase();
+        if (joined.includes('bond status')) {
+          const idx = cells.findIndex(c => /bond status/i.test(c));
+          bondStatusVal = cells[idx + 1] || '';
+          break;
+        }
+      }
+
+      // ── Bond amount (first big dollar amount after "Bond Amount" header) ──
+      let bondAmountVal = '';
+      for (let i = 0; i < allRows.length; i++) {
+        const cells = Array.from(allRows[i].querySelectorAll('td,th')).map(c => cellText(c));
+        if (cells.some(c => /^bond amount$/i.test(c.trim()))) {
+          // The amount is in the same row as a last cell, or next row
+          const amt = cells.find(c => /^\$[\d,]+\.\d{2}$/.test(c.trim()));
+          if (amt) { bondAmountVal = amt; break; }
+          const nextCells = Array.from((allRows[i+1] || document.createElement('tr')).querySelectorAll('td,th')).map(c => cellText(c));
+          const amt2 = nextCells.find(c => /^\$[\d,]+\.\d{2}$/.test(c.trim()));
+          if (amt2) { bondAmountVal = amt2; break; }
+        }
+      }
+
+      // ── Charges — parse each block precisely ────────────────
+      // Structure per charge:
+      //   Warrant | [num] | Warrant Date | [date] | [count]
+      //   Case    | [num] | OTN | [otn]
+      //   Offense Date | Code Section | Description | Type | Counts | Bond
+      //   [N/A]   | [OCGA...]  | [Crime description (Type)] | [Type] | [n] | [$]
+      //   Disposition | [value]
+      //   [next charge or Bond Amount section]
+
+      const charges = [];
+      let inCharges    = false;
+      let currentCharge = null;
+      let seenOffenseHeader = false;
+
+      // Known non-crime strings to skip
+      const skipDesc = new Set([
+        'description','n/a','','bond amount','bond status','indigent defense fund',
+        'jail construction & staffing act fund',
+        'poptf (peace officer & prosecutor training fund)',
+        'cobb county bond fee','bonding info','bonding company',
+      ]);
+
+      for (let i = 0; i < allRows.length; i++) {
+        const row   = allRows[i];
+        const cells = Array.from(row.querySelectorAll('td,th')).map(c => cellText(c));
+        const text  = cells.join('|').toLowerCase();
+
+        // Enter charges section
+        if (!inCharges) {
+          if (cells.some(c => /^charges$/i.test(c.trim()))) { inCharges = true; }
+          continue;
+        }
+
+        // Exit charges section
+        if (/release information/i.test(text) || /^attorney$/i.test(cells[0]?.trim())) break;
+
+        // Warrant line: first cell is "Warrant"
+        if (/^warrant$/i.test(cells[0]?.trim())) {
+          if (currentCharge) charges.push(currentCharge);
+          currentCharge = {
+            warrant:      cells[1] || '',
+            warrant_date: cells[3] || '',
+            case_number:  '',
+            otn:          '',
+            offense_date: '',
+            code_section: '',
+            description:  '',
+            type:         '',
+            counts:       '',
+            bond:         '',
+            disposition:  '',
+            bond_amount:  '',
+            bond_status:  '',
+          };
+          seenOffenseHeader = false;
+          continue;
+        }
+
+        if (!currentCharge) continue;
+
+        // Case line
+        if (/^case$/i.test(cells[0]?.trim())) {
+          currentCharge.case_number = cells[1] || '';
+          currentCharge.otn         = cells[3] || '';
+          continue;
+        }
+
+        // Offense Date / Code Section / Description header row — skip it
+        if (text.includes('offense date') && text.includes('code section') && text.includes('description')) {
+          seenOffenseHeader = true;
+          continue;
+        }
+
+        // Stop collecting charges at Bond Amount section
+        if (/^bond amount$/i.test(cells[0]?.trim()) || text.includes('bond amount')) {
+          const amt = cells.find(c => /^\$[\d,]+\.\d{2}$/.test(c.trim()));
+          if (amt) currentCharge.bond_amount = amt;
+          continue;
+        }
+
+        // Bond Status
+        if (text.includes('bond status')) {
+          const idx = cells.findIndex(c => /bond status/i.test(c));
+          currentCharge.bond_status = cells[idx + 1] || '';
+          continue;
+        }
+
+        // Disposition — only "Disposition" as first cell, value is next cell
+        if (/^disposition$/i.test(cells[0]?.trim())) {
+          // Only grab if value is NOT a dollar amount or fee name
+          const val = cells[1] || '';
+          if (val && !/^\$/.test(val) && !skipDesc.has(val.toLowerCase())) {
+            currentCharge.disposition = val;
+          }
+          continue;
+        }
+
+        // Charge data row — after seeing the offense header
+        // cells: [OffenseDate, CodeSection, Description, Type, Counts, Bond]
+        if (seenOffenseHeader && cells.length >= 3) {
+          const desc = cells[2] || '';
+          // Must be a real crime description — not a dollar amount, not a fee
+          if (
+            desc &&
+            desc.length > 3 &&
+            !skipDesc.has(desc.toLowerCase()) &&
+            !/^\$[\d,]+/.test(desc) &&
+            !/^\d{1,2}\/\d{1,2}\/\d{4}$/.test(desc)
+          ) {
+            currentCharge.offense_date = cells[0] || '';
+            currentCharge.code_section = cells[1] || '';
+            currentCharge.description  = desc;
+            currentCharge.type         = cells[3] || '';
+            currentCharge.counts       = cells[4] || '';
+            currentCharge.bond         = cells[5] || '';
+          }
+        }
+      }
+      if (currentCharge) charges.push(currentCharge);
+
+      const bodyText = (document.body?.innerText || '').toLowerCase();
+
+      return {
+        bookingRow, personalRow, physicalRow, addressRow, arrestRow, releaseRow,
+        caseWarrantVal, bondsmanName, bondStatusVal, bondAmountVal,
+        charges,
+        isReleased:  !bodyText.includes('not released'),
+        noAttorney:  bodyText.includes('no attorney of record'),
+        attorney:    bodyText.includes('no attorney of record') ? '' : '',
+      };
     });
 
-    const fullText = await page.evaluate(() => document.body.innerText || '');
-    console.log(`[scrape] ✅ Scraped ${allRows.length} rows`);
+    // Get attorney separately since findCellAfter not available in above scope
+    const attorney = await page.evaluate(() => {
+      const bodyText = (document.body?.innerText || '').toLowerCase();
+      if (bodyText.includes('no attorney of record')) return '';
+      const all = Array.from(document.querySelectorAll('td,th'));
+      for (let i = 0; i < all.length; i++) {
+        if ((all[i].innerText||'').trim().toLowerCase() === 'attorney') {
+          for (let j = i+1; j < all.length; j++) {
+            const v = (all[j].innerText||'').trim();
+            if (v && v.toLowerCase() !== 'attorney') return v;
+          }
+        }
+      }
+      return '';
+    });
 
-    const data = parseRows(allRows, fullText, searchName || soidVal);
+    extracted.attorney = attorney;
+
+    console.log(`[scrape] ✅ Scraped ${extracted.charges.length} charges`);
+    console.log(`[scrape] Charges: ${extracted.charges.map(c => c.description).join(' | ')}`);
+
+    const data = buildRecord(extracted, searchName || soidVal);
 
     return {
       found:      true,
@@ -167,155 +377,30 @@ async function scrapeInmate(searchName, soidVal) {
   }
 }
 
-function parseRows(allRows, fullText, originalName) {
-  const txt = (fullText || '').toLowerCase();
+function buildRecord(ex, originalName) {
+  const bookingRow  = ex.bookingRow  || [];
+  const personalRow = ex.personalRow || [];
+  const physicalRow = ex.physicalRow || [];
+  const addressRow  = ex.addressRow  || [];
+  const arrestRow   = ex.arrestRow   || [];
+  const releaseRow  = ex.releaseRow  || [];
+  const charges     = ex.charges     || [];
 
-  function findVal(label) {
-    const l = label.toLowerCase();
-    for (let i = 0; i < allRows.length; i++) {
-      for (let j = 0; j < allRows[i].length; j++) {
-        if ((allRows[i][j] || '').toLowerCase().trim() === l) {
-          if (allRows[i][j + 1]) return allRows[i][j + 1];
-          if (allRows[i + 1] && allRows[i + 1][0]) return allRows[i + 1][0];
-        }
-      }
-    }
-    return '';
-  }
-
-  // ── Booking Information ───────────────────────────────────
-  const agencyIdx   = allRows.findIndex(r => r.some(c => /agency id/i.test(c)));
-  const bookingRow  = agencyIdx >= 0 ? (allRows[agencyIdx + 1] || []) : [];
-
-  // ── Personal Information ──────────────────────────────────
-  const nameIdx     = allRows.findIndex(r => r.some(c => /^name$/i.test(c.trim())));
-  const personalRow = nameIdx >= 0 ? (allRows[nameIdx + 1] || []) : [];
-
-  // ── Physical ──────────────────────────────────────────────
-  const heightIdx   = allRows.findIndex(r => r.some(c => /^height$/i.test(c.trim())));
-  const physicalRow = heightIdx >= 0 ? (allRows[heightIdx + 1] || []) : [];
-
-  // ── Address ───────────────────────────────────────────────
-  const addrIdx    = allRows.findIndex(r => r.some(c => /^address$/i.test(c.trim())));
-  const addressRow = addrIdx >= 0 ? (allRows[addrIdx + 1] || []) : [];
-
-  // ── Arrest ────────────────────────────────────────────────
-  const arrestIdx  = allRows.findIndex(r => r.some(c => /arrest agency/i.test(c)));
-  const arrestRow  = arrestIdx >= 0 ? (allRows[arrestIdx + 1] || []) : [];
-
-  // ── Bondsman — header row has both "Case/Warrant" and "Bondsman's Name" ──
-  const caseWarrantIdx = allRows.findIndex(r =>
-    r.some(c => /case\/warrant/i.test(c)) && r.some(c => /bondsman/i.test(c))
-  );
-  const caseWarrantDataRow = caseWarrantIdx >= 0 ? (allRows[caseWarrantIdx + 1] || []) : [];
-  const caseWarrantVal     = caseWarrantDataRow[0] || '';
-  const bondsmanName       = caseWarrantDataRow[1] || '';
-
-  // ── Bond Status — find row containing "Bond Status" and grab next value ──
-  const bondStatusIdx = allRows.findIndex(r => r.some(c => /bond status/i.test(c)));
-  const bondStatusRow = bondStatusIdx >= 0 ? allRows[bondStatusIdx] : [];
-  const bondStatusVal = bondStatusRow.find((c, i) => i > 0 && c && !/bond status/i.test(c)) || '';
-
-  // ── Bond Amount — find row with "Bond Amount" header ─────
-  const bondAmountIdx = allRows.findIndex(r =>
-    r.length <= 2 && r.some(c => /^bond amount$/i.test(c.trim()))
-  );
-  const bondAmountRow = bondAmountIdx >= 0 ? allRows[bondAmountIdx] : [];
-  const bondAmountVal = bondAmountRow.find((c, i) => i > 0 && c && !/bond amount/i.test(c)) || '';
-
-  // ── Charges ───────────────────────────────────────────────
-  const charges = [];
-  let inCharges = false;
-  let currentCharge = null;
-
-  for (let i = 0; i < allRows.length; i++) {
-    const row  = allRows[i];
-    const text = row.join('|').toLowerCase();
-
-    if (!inCharges && text.includes('charges') && !text.includes('bond')) {
-      inCharges = true;
-      continue;
-    }
-    if (!inCharges) continue;
-    if (/release information|attorney/i.test(text)) break;
-
-    // Warrant line
-    if (/^warrant$/i.test((row[0] || '').trim())) {
-      if (currentCharge) charges.push(currentCharge);
-      currentCharge = {
-        warrant:      row[1] || '',
-        warrant_date: row[3] || '',
-        case_number:  '',
-        otn:          '',
-        offense_date: '',
-        code_section: '',
-        description:  '',
-        type:         '',
-        counts:       '',
-        bond:         '',
-        disposition:  '',
-        bond_amount:  '',
-        bond_status:  '',
-      };
-      continue;
-    }
-
-    if (/^case$/i.test((row[0] || '').trim()) && currentCharge) {
-      currentCharge.case_number = row[1] || '';
-      currentCharge.otn         = row[3] || '';
-      continue;
-    }
-
-    if (text.includes('offense date') && text.includes('code section')) continue;
-
-    if (/^disposition$/i.test((row[0] || '').trim()) && currentCharge) {
-      currentCharge.disposition = row[1] || '';
-      continue;
-    }
-
-    if (text.includes('bond amount') && currentCharge) {
-      currentCharge.bond_amount = row.filter(c => c && !/bond amount/i.test(c)).pop() || '';
-      continue;
-    }
-
-    if (text.includes('bond status') && currentCharge) {
-      const idx = row.findIndex(c => /bond status/i.test(c));
-      currentCharge.bond_status = row[idx + 1] || bondStatusVal;
-      continue;
-    }
-
-    // Charge data row
-    if (currentCharge && row[2] && row[2].length > 2 &&
-        !['description','type','n/a',''].includes(row[2].toLowerCase())) {
-      currentCharge.offense_date = row[0] || '';
-      currentCharge.code_section = row[1] || '';
-      currentCharge.description  = row[2] || '';
-      currentCharge.type         = row[3] || '';
-      currentCharge.counts       = row[4] || '';
-      currentCharge.bond         = row[5] || '';
-    }
-  }
-  if (currentCharge) charges.push(currentCharge);
-
-  // ── Release ───────────────────────────────────────────────
-  const relIdx     = allRows.findIndex(r => r.some(c => /^release date$/i.test(c.trim())));
-  const releaseRow = relIdx >= 0 ? (allRows[relIdx + 1] || []) : [];
-
-  // ── Height formatting ─────────────────────────────────────
+  // Height formatting
   let height = physicalRow[0] || '';
   if (/^\d{3,4}$/.test(height)) {
     const h = height.padStart(3, '0');
     height = `${h[0]}'${h.slice(1)}"`;
   }
 
-  // ── Race / Sex ────────────────────────────────────────────
+  // Race / Sex
   const RACE_MAP = { B:'Black', W:'White', H:'Hispanic', A:'Asian', O:'Other', I:'Indigenous', U:'Unknown' };
   const raceSex  = (personalRow[2] || '').replace(/\s/g, '');
   const [rc, sc] = raceSex.split('/');
   const race     = RACE_MAP[rc] || rc || '';
   const sex      = sc === 'M' ? 'Male' : sc === 'F' ? 'Female' : sc || '';
 
-  // ── SOID / event_id ───────────────────────────────────────
+  // SOID / event_id
   const rawSoid = (personalRow[4] || '').trim();
   const eventId = rawSoid ? String(parseInt(rawSoid.replace(/\D/g, ''), 10)) : '';
 
@@ -346,9 +431,9 @@ function parseRows(allRows, fullText, originalName) {
     hair:                physicalRow[2] || '',
     eyes:                physicalRow[3] || '',
     address:             [addressRow[0], addressRow[1], addressRow[2], addressRow[3]].filter(Boolean).join(', '),
-    place_of_birth:      findVal('place of birth'),
+    place_of_birth:      '',
     custody_status:      personalRow[3] || '',
-    is_released:         !txt.includes('not released'),
+    is_released:         ex.isReleased,
     days_in_custody:     personalRow[5] || '',
     release_date:        releaseRow[0]  || '',
     release_officer:     releaseRow[1]  || '',
@@ -359,16 +444,16 @@ function parseRows(allRows, fullText, originalName) {
     charges:             chargesDesc,
     charge_type:         chargeType,
     charges_detail:      charges,
-    bonding_amount:      bondAmountVal  || firstCharge.bond_amount || '',
-    bond_status:         bondStatusVal  || firstCharge.bond_status || '',
-    bonding_company:     bondsmanName,
-    bondsman_name:       bondsmanName,
-    case_warrant:        caseWarrantVal,
+    bonding_amount:      ex.bondAmountVal  || firstCharge.bond_amount || '',
+    bond_status:         ex.bondStatusVal  || firstCharge.bond_status || '',
+    bonding_company:     ex.bondsmanName   || '',
+    bondsman_name:       ex.bondsmanName   || '',
+    case_warrant:        ex.caseWarrantVal || '',
     warrant:             firstCharge.warrant     || '',
     case_number:         firstCharge.case_number || '',
     otn:                 firstCharge.otn         || '',
     disposition:         firstCharge.disposition || '',
-    attorney:            txt.includes('no attorney of record') ? '' : findVal('attorney'),
+    attorney:            ex.attorney || '',
     processed:           false,
     locked:              false,
     scraped_at:          new Date().toISOString(),
