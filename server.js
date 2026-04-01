@@ -8,10 +8,10 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
 
-const PROXY_HOST = process.env.PROXY_HOST || '107.172.163.27';
-const PROXY_PORT = process.env.PROXY_PORT || '6543';
-const PROXY_USER = process.env.PROXY_USER || 'bhkcvqwz';
-const PROXY_PASS = process.env.PROXY_PASS || '8o7dd3heu5b3';
+const PROXY_HOST = process.env.PROXY_HOST || '23.95.150.145';
+const PROXY_PORT = process.env.PROXY_PORT || '6114';
+const PROXY_USER = process.env.PROXY_USER || 'nblqtupi';
+const PROXY_PASS = process.env.PROXY_PASS || 'fg7nriv9yb5p';
 const PROXY_URL  = PROXY_HOST
   ? `http://${PROXY_USER}:${PROXY_PASS}@${PROXY_HOST}:${PROXY_PORT}`
   : null;
@@ -484,6 +484,36 @@ app.get('/proxy-test', async (req, res) => {
     if (browser) await browser.close().catch(() => {});
     res.json({ ok: false, proxy: `${PROXY_HOST}:${PROXY_PORT}`, error: err.message, ms: Date.now() - t,
       hint: 'Check PROXY_HOST/PROXY_PORT/PROXY_USER/PROXY_PASS in Railway Variables' });
+  }
+});
+
+app.get('/debug', async (req, res) => {
+  const t = Date.now();
+  let browser;
+  try {
+    browser = await launchBrowser();
+    const ctx  = await newContext(browser);
+    const page = await ctx.newPage();
+    const targetUrl = req.query.url || (BASE_URL + '/enter_name.shtm');
+    await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    await sleep(3000);
+    const title  = await page.title();
+    const html   = await page.content();
+    const finalUrl = page.url();
+    await ctx.close();
+    await browser.close();
+    res.json({
+      ok: true,
+      proxy: `${PROXY_HOST}:${PROXY_PORT}`,
+      final_url: finalUrl,
+      page_title: title,
+      html_length: html.length,
+      html_preview: html.substring(0, 2000),
+      ms: Date.now() - t
+    });
+  } catch (err) {
+    if (browser) await browser.close().catch(() => {});
+    res.json({ ok: false, error: err.message, ms: Date.now() - t });
   }
 });
 
